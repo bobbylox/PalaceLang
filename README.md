@@ -39,5 +39,6 @@ USER: What is the value of link 2?
 IDE: one
 USER: add link to input called place
 IDE: yes //all tools have a chain called input of type "box" which can hold anything.  It's essentially the parent variable type.
-USER: set step one to 
+USER: set step one to new split
+IDE: yes // "step one" should be syntax sugar for accessing the first link in a chain of type "command"
 
