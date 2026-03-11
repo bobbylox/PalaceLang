@@ -19,6 +19,11 @@
                   "type": "box",
                   "value": null,
                   "value_type": "string"
+                },
+                "sea quest": {
+                  "type": "chain",
+                  "value_type": "number",
+                  "links": []
                 }
               }
             }

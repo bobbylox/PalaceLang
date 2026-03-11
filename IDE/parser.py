@@ -459,10 +459,26 @@ class IDE:
 
         return {"error": f"cannot enter {kind!r}"}
 
+    def load_palace(self, name: str, palace_data: dict):
+        """Merge a loaded palace into the AST and navigate into it."""
+        self.ast["palaces"][name] = palace_data
+        self.current = {
+            "palace": name, "wing": None, "room": None,
+            "type_def": None, "instance": None, "device": None, "process_chain": None,
+        }
+
     def _cmd_go_to(self, name: str) -> Dict:
         palace = self.current["palace"]
         if palace is None:
-            return {"error": "no palace"}
+            # Already loaded in a previous session?
+            if name in self.ast.get("palaces", {}):
+                self.current = {
+                    "palace": name, "wing": None, "room": None,
+                    "type_def": None, "instance": None, "device": None, "process_chain": None,
+                }
+                return {"op": "go.palace", "name": name}
+            # Ask main.py to try loading from disk
+            return {"op": "load.palace", "name": name}
         palace_obj = self.ast["palaces"][palace]
 
         # check palace-level rooms

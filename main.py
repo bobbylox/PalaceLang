@@ -115,6 +115,24 @@ def main():
                 respond(f"error — {e}")
             continue
 
+        # ---- load palace from disk ---------------------------------------
+        if op == "load.palace":
+            name = action["name"]
+            filename = name.replace(" ", "_") + ".json"
+            if not os.path.exists(filename):
+                respond(f"no palace {name!r} and no file {filename!r}")
+                continue
+            with open(filename) as f:
+                data = json.load(f)
+            palace_data = data.get("palaces", {}).get(name)
+            if palace_data is None:
+                respond(f"{filename!r} does not contain palace {name!r}")
+                continue
+            ide.load_palace(name, palace_data)
+            save_state(ide.ast)
+            respond("yes")
+            continue
+
         # ---- query responses ---------------------------------------------
         if op == "whereami":
             parts = []
