@@ -127,7 +127,7 @@ class TestFibonacciSession(unittest.TestCase):
         ("append 1 to sequence",                                       "yes"),
         ("append false to sequence",                                   "cannot append boolean to chain of type number"),
         ("length of sequence?",                                        "3"),
-        ("enter new device adder over",                                "yes"),
+        ("enter device adder over",                                "yes"),
         ("set comment to this is a device for calculating fibonacci numbers recursively",
                                                                        "noted"),
         ("where am I?",                                                "device adder, room lobby, palace fibonacci"),
@@ -141,8 +141,8 @@ class TestFibonacciSession(unittest.TestCase):
         ("set step 2 to return sequence link input",                   "yes"),
         ("what is step length?",                                       "2"),
         ("set step 3 to else",                                         "yes"),
-        ("then set new box a to sequence link input minus 2",          "yes"),
-        ("then set new box b to sequence link input minus 1",          "yes"),
+        ("then set box a to sequence link input minus 2",          "yes"),
+        ("then set box b to sequence link input minus 1",          "yes"),
         ("then sequence link input is a plus b",                       "yes"),
         ("then return sequence input",                                 "yes"),
         ("run adder",                                                  "adder requires an input of type integer"),
@@ -240,7 +240,7 @@ class TestBoxScoping(unittest.TestCase):
         self.repl("device writer")
         self.repl("enter writer")
         self.repl("enter process")
-        self.repl("then set new box shared to 99")
+        self.repl("then set box shared to 99")
         self.repl("then return shared")
         self.assertEqual(self.repl("run writer"), "99")
         lobby = self.ide.ast["palaces"]["test"]["rooms"]["lobby"]
@@ -251,7 +251,7 @@ class TestBoxScoping(unittest.TestCase):
         self.repl("enter worker")
         self.repl("box local")  # device-level
         self.repl("enter process")
-        self.repl("then set new box local to 42")
+        self.repl("then set box local to 42")
         self.repl("then return local")
         self.assertEqual(self.repl("run worker"), "42")
         lobby = self.ide.ast["palaces"]["test"]["rooms"]["lobby"]
@@ -262,7 +262,7 @@ class TestBoxScoping(unittest.TestCase):
         self.repl("box tally")
         # device A sets it
         for cmd in ["device setter", "enter setter", "enter process",
-                    "then set new box tally to 77", "exit"]:
+                    "then set box tally to 77", "exit"]:
             self.repl(cmd)
         # device B reads it
         for cmd in ["device getter", "enter getter", "enter process",
@@ -335,7 +335,7 @@ class TestWingNavigation(unittest.TestCase):
         self.repl("enter east")
         self.repl("room vault")
         self.repl("enter vault")
-        self.repl("enter new device triple")
+        self.repl("enter device triple")
         self.repl("enter process")
         self.repl("then return input")
         self.assertEqual(self.repl("run triple on 4"), "4")
@@ -384,7 +384,7 @@ class TestTypedBoxes(unittest.TestCase):
         """Writing a wrong type to a typed box at runtime raises an error."""
         self.repl("box score of number")
         for cmd in ["device bad", "enter bad", "enter process",
-                    "then set new box score to hello",
+                    "then set box score to hello",
                     "then return score"]:
             self.repl(cmd)
         resp = self.repl("run bad")
@@ -393,7 +393,7 @@ class TestTypedBoxes(unittest.TestCase):
     def test_runtime_correct_type_succeeds(self):
         self.repl("box score of number")
         for cmd in ["device good", "enter good", "enter process",
-                    "then set new box score to 7",
+                    "then set box score to 7",
                     "then return score"]:
             self.repl(cmd)
         self.assertEqual(self.repl("run good"), "7")
@@ -411,7 +411,7 @@ class TestTypedBoxes(unittest.TestCase):
         # untyped boxes accept any value that the evaluator can produce.
         self.repl("box misc")
         for cmd in ["device setter", "enter setter", "enter process",
-                    "then set new box misc to 5",
+                    "then set box misc to 5",
                     "then return misc"]:
             self.repl(cmd)
         self.assertEqual(self.repl("run setter"), "5")
@@ -840,14 +840,14 @@ class TestUserTypes(unittest.TestCase):
         self.repl("enter device area")
         self.repl("exit")
         result = self.repl("look around")
-        self.assertIn("a box named radius", result)
-        self.assertIn("a device named area", result)
+        self.assertIn("a box named 'radius'", result)
+        self.assertIn("a device named 'area'", result)
 
     def test_look_around_instance_in_room(self):
         self._setup_circle()
         self.repl("circle doofus")
         result = self.repl("look around")
-        self.assertIn("a circle named doofus", result)
+        self.assertIn("a circle named 'doofus'", result)
 
     def test_two_instances_independent(self):
         self._setup_circle()
@@ -947,51 +947,56 @@ class TestLookAround(unittest.TestCase):
         self.repl("enter lobby")
 
     def test_empty_room(self):
-        self.assertEqual(self.repl("look around"), "you see nothing")
+        result = self.repl("look around")
+        self.assertIn("room 'lobby'", result)
+        self.assertIn("You see nothing", result)
 
     def test_room_with_device_and_box(self):
         self.repl("device adder")
         self.repl("box score")
         result = self.repl("look around")
-        self.assertIn("a device named adder", result)
-        self.assertIn("a box named score", result)
+        self.assertIn("a device named 'adder'", result)
+        self.assertIn("a box named 'score'", result)
 
     def test_room_multi_word_name_uses_stop(self):
-        # "immersion blender" as device name — requires multi-word creation
         self.repl("chain sequence")
         self.repl("box fruit")
         result = self.repl("look around")
-        # multiple items are separated by " stop and "
-        self.assertIn(" stop and ", result)
+        # multiple items are separated by ", "
+        self.assertIn("a chain named 'sequence'", result)
+        self.assertIn("a box named 'fruit'", result)
 
     def test_room_single_item_no_stop(self):
         self.repl("box fruit")
         result = self.repl("look around")
-        self.assertTrue(result.startswith("you see a box named fruit"))
-        self.assertNotIn(" stop and ", result)
+        self.assertIn("a box named 'fruit'", result)
+        self.assertIn("You see:", result)
 
     def test_device_context_shows_boxes(self):
         self.repl("device calc")
         self.repl("enter calc")
         self.repl("box temp")
         result = self.repl("look around")
-        self.assertIn("a box named temp", result)
+        self.assertIn("a box named 'temp'", result)
         # the device itself should not appear (we're inside it)
-        self.assertNotIn("a device named calc", result)
+        self.assertNotIn("a device named 'calc'", result)
 
-    def test_device_context_empty(self):
+    def test_device_context_shows_input_and_process(self):
         self.repl("device calc")
         self.repl("enter calc")
-        self.assertEqual(self.repl("look around"), "you see nothing")
+        result = self.repl("look around")
+        # always shows input box and process chain
+        self.assertIn("a box named 'input'", result)
+        self.assertIn("a chain named 'process'", result)
 
     def test_various_types_in_room(self):
         self.repl("chain log")
         self.repl("bag store")
         self.repl("box counter")
         result = self.repl("look around")
-        self.assertIn("a chain named log", result)
-        self.assertIn("a bag named store", result)
-        self.assertIn("a box named counter", result)
+        self.assertIn("a chain named 'log'", result)
+        self.assertIn("a bag named 'store'", result)
+        self.assertIn("a box named 'counter'", result)
 
 
 # ---------------------------------------------------------------------------

@@ -2,7 +2,7 @@ import re
 import json
 import copy
 import os
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple, NamedTuple
 
 # Load built-in type definitions once at module level.
 _BUILTIN_PATH = os.path.join(os.path.dirname(__file__), "..", "builtin.json")
@@ -66,6 +66,318 @@ _OP_TO_KIND: List[Tuple[str, str]] = [
     ("enter.instance", "instance"),
     ("instance",    "instance"),
 ]
+
+# ---------------------------------------------------------------------------
+# Tokenizer
+# ---------------------------------------------------------------------------
+
+class Token(NamedTuple):
+    kind: str   # WORD, NUM, APOS, QM, END
+    val: Any    # lowercased word for WORD, numeric for NUM, None otherwise
+    orig: str   # original text (for value reconstruction)
+
+
+def _tokenize(text: str) -> List[Token]:
+    """Tokenize text into a list of Tokens (with END sentinel).
+
+    Token kinds:
+      WORD  — any word token, val is lowercased
+      NUM   — numeric literal, val is int or float
+      APOS  — literal 's (possessive / "link")
+      QM    — literal ?
+      END   — sentinel
+    """
+    tokens: List[Token] = []
+    # Split on whitespace; handle 's and ? specially
+    i = 0
+    raw_words = text.split()
+    for raw in raw_words:
+        # Check for trailing ? or 's
+        while raw.endswith("?"):
+            core = raw[:-1]
+            if core:
+                _add_word_or_num(tokens, core)
+            tokens.append(Token("QM", None, "?"))
+            raw = ""
+            break
+        if not raw:
+            continue
+        # Handle 's suffix
+        if raw.endswith("'s") or raw.endswith("'"):
+            core = raw[:-2] if raw.endswith("'s") else raw[:-1]
+            if core:
+                _add_word_or_num(tokens, core)
+            tokens.append(Token("APOS", None, "'s"))
+            continue
+        _add_word_or_num(tokens, raw)
+    tokens.append(Token("END", None, ""))
+    return tokens
+
+
+def _add_word_or_num(tokens: List[Token], raw: str):
+    """Add a WORD or NUM token for the given raw string."""
+    # Try int
+    try:
+        v = int(raw)
+        tokens.append(Token("NUM", v, raw))
+        return
+    except ValueError:
+        pass
+    # Try float
+    try:
+        v = float(raw)
+        tokens.append(Token("NUM", v, raw))
+        return
+    except ValueError:
+        pass
+    tokens.append(Token("WORD", raw.lower(), raw))
+
+
+# ---------------------------------------------------------------------------
+# Earley Parser
+# ---------------------------------------------------------------------------
+# Items: (rule_idx, dot, origin) stored as tuples for hashability.
+# Grammar: _RULES list of (lhs, rhs_tuple); _NT_IDX maps lhs -> [rule_idx].
+# Terminals: lowercase str = match WORD with that value; "WORD"/"NUM"/"APOS"/"QM"
+#            = match any token of that kind.
+# Non-terminals: strings whose first character is uppercase.
+# Epsilon rules: rhs = () (empty tuple).
+
+_RULES: List[Tuple[str, Tuple]] = []
+_NT_IDX: Dict[str, List[int]] = {}
+
+
+def _R(lhs: str, *rhs: str) -> int:
+    """Add a grammar rule; return its index."""
+    idx = len(_RULES)
+    _RULES.append((lhs, rhs))
+    _NT_IDX.setdefault(lhs, []).append(idx)
+    return idx
+
+
+_TOKEN_TYPES = {"WORD", "NUM", "APOS", "QM", "END"}
+
+def _is_nt(sym: str) -> bool:
+    return bool(sym) and sym[0].isupper() and sym not in _TOKEN_TYPES
+
+
+def _terminal_matches(sym: str, tok: Token) -> bool:
+    if sym == "WORD":  return tok.kind == "WORD"
+    if sym == "NUM":   return tok.kind == "NUM"
+    if sym == "APOS":  return tok.kind == "APOS"
+    if sym == "QM":    return tok.kind == "QM"
+    return tok.kind == "WORD" and tok.val == sym
+
+
+# ── Optional helpers (epsilon + filled) ──────────────────────────────────────
+_R("OptThe");         _R("OptThe",    "the")
+_R("OptQM");          _R("OptQM",     "QM")
+_R("OptApos");        _R("OptApos",   "APOS")
+_R("OptNew");         _R("OptNew",    "new")
+_R("OptCalled");      _R("OptCalled", "called");  _R("OptCalled", "named")
+_R("OptWhatIs");      _R("OptWhatIs", "what", "is", "OptThe")
+_R("OptValueOf");     _R("OptValueOf","value", "of")
+
+# ── Name non-terminals ────────────────────────────────────────────────────────
+_R("Sname", "WORD")                              # exactly one word
+_R("Mname", "WORD")                              # one word, no stop
+_R("Mname", "WORD", "stop")                      # one word + stop
+_R("Mname", "WORD", "MnameTail")                 # multi-word
+_R("MnameTail", "WORD")
+_R("MnameTail", "WORD", "stop")
+_R("MnameTail", "WORD", "MnameTail")
+
+# ── Value: any token sequence (at least one) until END ────────────────────────
+_R("Value", "WORD");  _R("Value", "NUM");  _R("Value", "APOS")
+_R("Value", "WORD", "Value")
+_R("Value", "NUM",  "Value")
+_R("Value", "APOS", "Value")
+
+# ── Command rules (lower index = higher priority) ─────────────────────────────
+_LOOK_AROUND  = _R("Command", "look", "around")
+_WHEREAMI     = _R("Command", "where", "am", "i", "OptQM")
+_STEP_LENGTH  = _R("Command", "what", "is", "OptThe", "step", "length", "OptQM")
+_QUERY_LINK   = _R("Command", "OptWhatIs", "OptValueOf", "Sname", "OptApos",
+                               "link", "NUM", "OptQM")
+_LENGTH       = _R("Command", "OptWhatIs", "length", "of", "Sname", "OptQM")
+
+_PALACE       = _R("Command", "OptNew", "palace", "OptCalled", "Mname")
+_ENTER_TYPED  = _R("Command", "enter", "OptNew", "Sname", "OptCalled", "Mname")
+_ENTER        = _R("Command", "enter", "Sname")
+_GO_TO        = _R("Command", "go", "to", "Sname")
+_GO_OUTSIDE   = _R("Command", "go", "outside")
+_EXIT         = _R("Command", "exit")
+
+_WING         = _R("Command", "OptNew", "wing", "OptCalled", "Sname")
+_ROOM         = _R("Command", "OptNew", "room", "OptCalled", "Sname")
+_CHAIN_TYPED  = _R("Command", "OptNew", "chain", "of", "Sname", "OptCalled", "Mname")
+_CHAIN        = _R("Command", "OptNew", "chain", "OptCalled", "Mname")
+_BAG_TYPED    = _R("Command", "OptNew", "bag",   "of", "Sname", "OptCalled", "Mname")
+_BAG          = _R("Command", "OptNew", "bag",   "OptCalled", "Mname")
+_BOX_N_TYPED  = _R("Command", "OptNew", "box",   "OptCalled", "Sname", "of", "Sname")   # box NAME of TYPE
+_BOX_OF_NAMED = _R("Command", "OptNew", "box",   "of", "Sname", "OptCalled", "Mname")   # box of TYPE NAME
+_BOX_OF_ANON  = _R("Command", "OptNew", "box",   "of", "Sname")                         # box of TYPE
+_BOX          = _R("Command", "OptNew", "box",   "OptCalled", "Mname")
+_DEVICE       = _R("Command", "OptNew", "device","OptCalled", "Sname")
+_TYPE         = _R("Command", "OptNew", "type",  "OptCalled", "Sname")
+
+_APPEND_LINK  = _R("Command", "append", "link", "to", "Sname")
+_APPEND_VAL   = _R("Command", "append", "Value", "to", "Sname")
+
+_SET_BOX_TYPED = _R("Command", "set", "box", "of", "Sname", "to", "Value")
+_SET_BOX_NAMED = _R("Command", "set", "box", "Mname", "to", "Value")
+_SET_CLINK     = _R("Command", "set", "Sname", "OptApos", "link", "NUM", "to", "Value")
+_SET_LVAL      = _R("Command", "set", "link", "value", "to", "Value")
+_SET_LVAL2     = _R("Command", "set", "link", "value", "Value")
+_SET_INPUT_N   = _R("Command", "set", "input", "name", "to", "Value")
+_SET_INPUT_T   = _R("Command", "set", "input", "type", "to", "Value")
+_SET_COMMENT   = _R("Command", "set", "comment", "to", "Value")
+_SET_STEP      = _R("Command", "set", "step",    "NUM", "to", "Value")
+_SET_PATTERN   = _R("Command", "set", "pattern", "to", "Value")
+_SET_CHAIN_LIT = _R("Command", "set", "chain",   "Mname", "to", "Value")
+_SET_BOX_VAL   = _R("Command", "set", "Sname", "to", "Value")
+_SET_POSS      = _R("Command", "set", "Sname", "OptApos", "Value", "to", "Value")
+
+_THEN          = _R("Command", "then", "Value")
+_STEP_SH       = _R("Command", "step", "NUM", "Value")
+
+_RUN_FULL      = _R("Command", "run", "Sname", "APOS", "Sname", "APOS", "Sname")
+_RUN_FULL_ON   = _R("Command", "run", "Sname", "APOS", "Sname", "APOS", "Sname",
+                                "on", "Value")
+_RUN_ROOM      = _R("Command", "run", "Sname", "APOS", "Sname")
+_RUN_ROOM_ON   = _R("Command", "run", "Sname", "APOS", "Sname", "on", "Value")
+_RUN           = _R("Command", "run", "Sname")
+_RUN_ON        = _R("Command", "run", "Sname", "on", "Value")
+
+_INSTANTIATE   = _R("Command", "OptNew", "Sname", "OptCalled", "Sname")
+
+
+# ── Earley algorithm ──────────────────────────────────────────────────────────
+
+def _earley(tokens: List[Token]) -> List[set]:
+    """
+    Run the Earley parsing algorithm.  Items are (rule_idx, dot, origin).
+    Returns chart[0..n] where chart[i] is the set of completed/active items
+    at position i.  Epsilon rules are completed immediately during prediction.
+    """
+    n = len(tokens)
+    chart: List[set] = [set() for _ in range(n + 1)]
+
+    # Seed with all Command rules at position 0
+    for ri in _NT_IDX.get("Command", []):
+        chart[0].add((ri, 0, 0))
+
+    for i in range(n + 1):
+        queue = list(chart[i])
+        qi = 0
+        while qi < len(queue):
+            item = queue[qi]; qi += 1
+            ri, dot, origin = item
+            lhs, rhs = _RULES[ri]
+
+            if dot == len(rhs):
+                # COMPLETE: advance items in chart[origin] waiting for lhs
+                for prev in list(chart[origin]):
+                    pri, pdot, porigin = prev
+                    plhs, prhs = _RULES[pri]
+                    if pdot < len(prhs) and prhs[pdot] == lhs:
+                        new = (pri, pdot + 1, porigin)
+                        if new not in chart[i]:
+                            chart[i].add(new)
+                            queue.append(new)
+            else:
+                sym = rhs[dot]
+                if _is_nt(sym):
+                    # PREDICT: add rules for sym; handle epsilon immediately
+                    for new_ri in _NT_IDX.get(sym, []):
+                        nlhs, nrhs = _RULES[new_ri]
+                        if not nrhs:
+                            # Epsilon: add the completed item, then advance parent
+                            eps = (new_ri, 0, i)
+                            if eps not in chart[i]:
+                                chart[i].add(eps)
+                            adv = (ri, dot + 1, origin)
+                            if adv not in chart[i]:
+                                chart[i].add(adv)
+                                queue.append(adv)
+                        else:
+                            new = (new_ri, 0, i)
+                            if new not in chart[i]:
+                                chart[i].add(new)
+                                queue.append(new)
+                # terminals are scanned below
+
+        # SCAN: advance items at chart[i] whose next terminal matches tokens[i]
+        if i < n and tokens[i].kind != "END":
+            tok = tokens[i]
+            for item in chart[i]:
+                ri, dot, origin = item
+                lhs, rhs = _RULES[ri]
+                if dot < len(rhs) and not _is_nt(rhs[dot]):
+                    if _terminal_matches(rhs[dot], tok):
+                        new = (ri, dot + 1, origin)
+                        if new not in chart[i + 1]:
+                            chart[i + 1].add(new)
+
+    return chart
+
+
+# ── Parse tree extraction ─────────────────────────────────────────────────────
+
+def _nt_complete(chart: List[set], nt: str, start: int, end: int) -> bool:
+    """True if NT has a completed derivation spanning tokens[start:end]."""
+    for ri, dot, origin in chart[end]:
+        if origin == start and dot == len(_RULES[ri][1]) and _RULES[ri][0] == nt:
+            return True
+    return False
+
+
+def _find_spans(chart, rhs, rhs_idx, pos, end, tokens):
+    """
+    Reconstruct spans for rhs[rhs_idx:] covering tokens[pos:end].
+    Returns list of (sym, start, end, sub) or None.
+    sub=None for terminals; sub=list for NTs (sub-spans of their derivation).
+    Opt* NTs use longest-first (greedy) matching; all others use shortest-first.
+    """
+    if rhs_idx == len(rhs):
+        return [] if pos == end else None
+
+    sym = rhs[rhs_idx]
+    if _is_nt(sym):
+        # Opt* nonterminals: try longest span first (greedy), so APOS/tokens
+        # are consumed by the optional NT rather than by the following Value NT.
+        if sym.startswith("Opt"):
+            candidates = range(end, pos - 1, -1)
+        else:
+            candidates = range(pos, end + 1)
+        for nt_end in candidates:
+            if not _nt_complete(chart, sym, pos, nt_end):
+                continue
+            rest = _find_spans(chart, rhs, rhs_idx + 1, nt_end, end, tokens)
+            if rest is not None:
+                sub = _find_nt_spans(chart, sym, pos, nt_end, tokens)
+                return [(sym, pos, nt_end, sub)] + rest
+        return None
+    else:
+        if pos >= end:
+            return None
+        tok = tokens[pos]
+        if _terminal_matches(sym, tok):
+            rest = _find_spans(chart, rhs, rhs_idx + 1, pos + 1, end, tokens)
+            if rest is not None:
+                return [(sym, pos, pos + 1, None)] + rest
+        return None
+
+
+def _find_nt_spans(chart, nt, start, end, tokens):
+    """Return sub-spans for one completed derivation of NT from start to end."""
+    for ri, dot, origin in chart[end]:
+        lhs, rhs = _RULES[ri]
+        if lhs == nt and origin == start and dot == len(rhs):
+            spans = _find_spans(chart, rhs, 0, start, end, tokens)
+            if spans is not None:
+                return spans
+    return []
 
 
 class IDE:
@@ -166,104 +478,44 @@ class IDE:
         t = re.sub(r'\bthe (\w+)\b', _replace_the, t, flags=re.IGNORECASE)
         return t
 
+
     # ------------------------------------------------------------------
-    # Main dispatcher
+    # Main dispatcher (Earley parser)
     # ------------------------------------------------------------------
 
     def process(self, utterance: str) -> Dict[str, Any]:
         t = self._preprocess(utterance)
+        tokens = _tokenize(t)
+        # END token is last; it's at index len(tokens)-1
+        k = len(tokens) - 1
+        chart = _earley(tokens)
 
-        patterns: List[Tuple[str, Any]] = [
-            # --- Queries (most specific first) ---
-            (r"^look around$", self._cmd_look_around),
-            (r"^where am [Ii]\?*$", self._cmd_whereami),
-            (r"^what is (?:the )?step length\??$", self._cmd_step_length),
-            (r"^what is (?:the )?(?P<value_of>value of )?(?P<chain>\w+)(?:'s)? link (?P<idx>\d+)\??$",
-             self._cmd_query_link),
-            (r"^(?:what is (?:the )?)?length of (?P<chain>\w+)\??$",
-             self._cmd_length),
-
-            # --- Palace & navigation ---
-            (r"^palace (?:called |named )?(?P<name>\w+)(?: stop)?$", self._cmd_palace),
-            (r"^enter (?:new )?(?P<kind>\w+) (?P<name>.+?)(?: stop)?$",
-             self._cmd_enter_typed),
-            (r"^enter (?P<name>\w+)(?: stop)?$", self._cmd_enter),
-            (r"^go to (?P<name>\w+)(?: stop)?$", self._cmd_go_to),
-            (r"^go outside$", self._cmd_go_outside),
-            (r"^exit$", self._cmd_exit),
-
-            # --- Creation ---
-            (r"^wing (?P<name>\w+)(?: stop)?$", self._cmd_wing),
-            (r"^room (?P<name>\w+)(?: stop)?$", self._cmd_room),
-            (r"^chain(?: of (?P<btype>\w+))? (?P<name>.+?)(?: stop)?$", self._cmd_chain),
-            (r"^bag(?: of (?P<btype>\w+))? (?P<name>.+?)(?: stop)?$", self._cmd_bag),
-            (r"^device (?P<name>\w+)(?: stop)?$", self._cmd_create_device),
-            (r"^box (?P<name>\w+) of (?P<btype>\w+)(?: stop)?$", self._cmd_box_typed),
-            (r"^box of (?P<btype>\w+)(?: (?P<name>.+?))?(?: stop)?$", self._cmd_box_typed),
-            (r"^box (?P<name>.+?)(?: stop)?$", self._cmd_box),
-            (r"^type (?P<name>\w+)(?: stop)?$", self._cmd_type),
-
-            # --- Append ---
-            (r"^append link to (?P<chain>\w+)(?: stop)?$", self._cmd_append_link),
-            (r"^append (?P<value>.+) to (?P<chain>\w+)$",
-             self._cmd_append_to_chain),
-
-            # --- Set (specific → general) ---
-            (r"^set box of (?P<btype>\w+) to (?P<value>.+)$",
-             self._cmd_set_box_typed),
-            (r"^set box (?P<name>.+?)(?: stop)? to (?P<value>.+)$",
-             self._cmd_set_box_value_named),
-            (r"^set (?P<chain>\w+)(?:'s)? link (?P<idx>\d+) to (?P<value>.+)$",
-             self._cmd_set_chain_link),
-            (r"^set link value (?:to )?(?P<value>.+)$",
-             self._cmd_set_link_value),
-            (r"^set input (?P<prop>name|type) to (?P<value>.+)$", self._cmd_set_input),
-            (r"^set comment to (?P<value>.+)$", self._cmd_set_comment),
-            (r"^set step (?P<idx>\d+) to (?P<body>.+)$", self._cmd_set_step),
-            (r"^set pattern to (?P<value>.+)$", self._cmd_set_pattern),
-            (r"^set chain (?P<name>.+?) to (?P<values>.+)$", self._cmd_set_chain_literal),
-            (r"^set (?P<name>\w+) to (?P<value>.+)$", self._cmd_set_box_value),
-            (r"^set (?P<owner>\w+)(?:'s)? (?P<prop>.+?) to (?P<value>.+)$",
-             self._cmd_set_possessive),
-
-            # --- Then (step-append sugar) ---
-            (r"^then (?P<body>.+)$", self._cmd_then),
-            (r"^step (?P<idx>\d+) (?P<body>.+)$", self._cmd_step_shorthand),
-
-            # --- Run (3-level → 2-level → 1-level) ---
-            (r"^run (?P<palace>\w+)'s? (?P<room>\w+)'s? (?P<device>\w+)"
-             r"(?: on (?P<value>.+))?$", self._cmd_run_full),
-            (r"^run (?P<room>\w+)'s? (?P<device>\w+)(?: on (?P<value>.+))?$",
-             self._cmd_run_room),
-            (r"^run (?P<device>\w+)(?: on (?P<value>.+))?$", self._cmd_run),
-            (r"^(?P<type_name>[a-zA-Z]\w*) (?P<instance_name>[a-zA-Z]\w*)(?: stop)?$", self._cmd_instantiate),
-        ]
-
-        for pat, fn in patterns:
-            m = re.match(pat, t, re.IGNORECASE)
-            if m:
-                res = fn(**m.groupdict())
-                if isinstance(res, dict):
-                    if "name" in res:
-                        name = res["name"]
-                        self._last_by_type["it"] = name
-                        op = res.get("op", "")
-                        for prefix, kind in _OP_TO_KIND:
-                            if op.startswith(prefix):
-                                self._last_by_type[kind] = name
-                                # instance.create also records under its user type name
-                                if kind == "instance" and "type" in res:
-                                    self._last_by_type[res["type"]] = name
-                                break
-                    if "error" in res:
-                        return {"ok": False, "error": res["error"]}
-                return {"ok": True, "action": res}
+        # Find lowest-index completed Command rule spanning tokens[0:k]
+        for ri in _NT_IDX.get("Command", []):
+            lhs, rhs = _RULES[ri]
+            if (ri, len(rhs), 0) in chart[k]:
+                spans = _find_spans(chart, rhs, 0, 0, k, tokens)
+                if spans is not None:
+                    res = self._dispatch_earley(ri, spans, tokens)
+                    if isinstance(res, dict):
+                        if "name" in res:
+                            name = res["name"]
+                            self._last_by_type["it"] = name
+                            op = res.get("op", "")
+                            for prefix, kind in _OP_TO_KIND:
+                                if op.startswith(prefix):
+                                    self._last_by_type[kind] = name
+                                    if kind == "instance" and "type" in res:
+                                        self._last_by_type[res["type"]] = name
+                                    break
+                        if "error" in res:
+                            return {"ok": False, "error": res["error"]}
+                    return {"ok": True, "action": res}
 
         action = self._try_type_patterns(t)
         if action is not None:
             return {"ok": True, "action": action}
 
-        # last resort: try as a raw arithmetic expression
         try:
             v = self._eval_arith(t)
             if isinstance(v, float) and v.is_integer():
@@ -272,6 +524,291 @@ class IDE:
         except (ValueError, TypeError, ZeroDivisionError):
             pass
         return {"ok": False, "error": f"unrecognized: {t}"}
+
+    def _dispatch_earley(self, ri: int, spans, tokens: List[Token]) -> Dict:
+        """Dispatch to the appropriate _cmd_* handler based on the matched rule index."""
+
+        def _sname(n: int = 0) -> Optional[str]:
+            """Return the nth Sname value (original case, single word)."""
+            cnt = 0
+            for sym, s, e, _ in spans:
+                if sym == "Sname":
+                    if cnt == n:
+                        return " ".join(tokens[i].orig for i in range(s, e))
+                    cnt += 1
+            return None
+
+        def _mname(n: int = 0) -> Optional[str]:
+            """Return the nth Mname value (stop stripped)."""
+            cnt = 0
+            for sym, s, e, _ in spans:
+                if sym == "Mname":
+                    if cnt == n:
+                        words = [tokens[i].orig for i in range(s, e)
+                                 if not (tokens[i].kind == "WORD" and tokens[i].val == "stop")]
+                        return " ".join(words)
+                    cnt += 1
+            return None
+
+        def _value(n: int = 0) -> Optional[str]:
+            """Return the nth Value as a reconstructed string."""
+            cnt = 0
+            for sym, s, e, _ in spans:
+                if sym == "Value":
+                    if cnt == n:
+                        return " ".join(tokens[i].orig for i in range(s, e))
+                    cnt += 1
+            return None
+
+        def _num(n: int = 0) -> Optional[Any]:
+            """Return the nth NUM token value."""
+            cnt = 0
+            for sym, s, e, sub in spans:
+                if sym == "NUM":
+                    if cnt == n:
+                        return tokens[s].val
+                    cnt += 1
+            # Also search in all spans including sub-spans
+            cnt = 0
+            for tok in tokens:
+                if tok.kind == "NUM":
+                    if cnt == n:
+                        return tok.val
+                    cnt += 1
+            return None
+
+        def _opt_present(opt_sym: str) -> bool:
+            """True if an optional NT consumed at least one token (non-epsilon)."""
+            for sym, s, e, _ in spans:
+                if sym == opt_sym:
+                    return e > s
+            return False
+
+        # Helper: find NUMs in token list between positions
+        def _find_num_in_tokens(start: int, end: int) -> Optional[Any]:
+            for i in range(start, end):
+                if tokens[i].kind == "NUM":
+                    return tokens[i].val
+            return None
+
+        # For rules with NUM directly in the rhs (not wrapped in a NT), 
+        # we need to find them in spans as terminal entries
+        def _terminal_num(n: int = 0) -> Optional[Any]:
+            cnt = 0
+            for sym, s, e, sub in spans:
+                if sym == "NUM":
+                    if cnt == n:
+                        return tokens[s].val
+                    cnt += 1
+            return None
+
+        # ── Dispatch by rule index ─────────────────────────────────────────────────────
+
+        if ri == _LOOK_AROUND:
+            return self._cmd_look_around()
+
+        if ri == _WHEREAMI:
+            return self._cmd_whereami()
+
+        if ri == _STEP_LENGTH:
+            return self._cmd_step_length()
+
+        if ri == _QUERY_LINK:
+            # set "chain" OptWhatIs OptValueOf Sname OptApos link NUM OptQM
+            chain = _sname(0)
+            value_of = _opt_present("OptValueOf")
+            # Find the NUM token in the span
+            num_val = None
+            for sym, s, e, sub in spans:
+                if sym == "NUM":
+                    num_val = tokens[s].val
+                    break
+            return self._cmd_query_link(
+                chain=chain,
+                idx=str(int(num_val)) if num_val is not None else "1",
+                value_of="value of " if value_of else None
+            )
+
+        if ri == _LENGTH:
+            return self._cmd_length(chain=_sname(0))
+
+        if ri == _PALACE:
+            return self._cmd_palace(name=_mname(0))
+
+        if ri == _ENTER_TYPED:
+            return self._cmd_enter_typed(kind=_sname(0), name=_mname(0))
+
+        if ri == _ENTER:
+            return self._cmd_enter(name=_sname(0))
+
+        if ri == _GO_TO:
+            return self._cmd_go_to(name=_sname(0))
+
+        if ri == _GO_OUTSIDE:
+            return self._cmd_go_outside()
+
+        if ri == _EXIT:
+            return self._cmd_exit()
+
+        if ri == _WING:
+            return self._cmd_wing(name=_sname(0))
+
+        if ri == _ROOM:
+            return self._cmd_room(name=_sname(0))
+
+        if ri == _CHAIN_TYPED:
+            # OptNew "chain" "of" Sname OptCalled Mname -> btype=Sname, name=Mname
+            return self._cmd_chain(name=_mname(0), btype=_sname(0))
+
+        if ri == _CHAIN:
+            return self._cmd_chain(name=_mname(0), btype=None)
+
+        if ri == _BAG_TYPED:
+            return self._cmd_bag(name=_mname(0), btype=_sname(0))
+
+        if ri == _BAG:
+            return self._cmd_bag(name=_mname(0), btype=None)
+
+        if ri == _BOX_N_TYPED:
+            # OptNew "box" OptCalled Sname "of" Sname -> name=sname(0), btype=sname(1)
+            return self._cmd_box_typed(btype=_sname(1), name=_sname(0))
+
+        if ri == _BOX_OF_NAMED:
+            # OptNew "box" "of" Sname OptCalled Mname -> btype=sname(0), name=mname(0)
+            return self._cmd_box_typed(btype=_sname(0), name=_mname(0))
+
+        if ri == _BOX_OF_ANON:
+            # OptNew "box" "of" Sname -> btype=sname(0), no name
+            return self._cmd_box_typed(btype=_sname(0), name=None)
+
+        if ri == _BOX:
+            return self._cmd_box(name=_mname(0))
+
+        if ri == _DEVICE:
+            return self._cmd_create_device(name=_sname(0))
+
+        if ri == _TYPE:
+            return self._cmd_type(name=_sname(0))
+
+        if ri == _APPEND_LINK:
+            # "append" "link" "to" Sname
+            return self._cmd_append_link(chain=_sname(0))
+
+        if ri == _APPEND_VAL:
+            # "append" Value "to" Sname
+            return self._cmd_append_to_chain(value=_value(0), chain=_sname(0))
+
+        if ri == _SET_BOX_TYPED:
+            # "set" "box" "of" Sname "to" Value
+            return self._cmd_set_box_typed(btype=_sname(0), value=_value(0))
+
+        if ri == _SET_BOX_NAMED:
+            # "set" "box" Mname "to" Value
+            return self._cmd_set_box_value_named(name=_mname(0), value=_value(0))
+
+        if ri == _SET_CLINK:
+            # "set" Sname OptApos "link" NUM "to" Value
+            num_val = None
+            for sym, s, e, sub in spans:
+                if sym == "NUM":
+                    num_val = tokens[s].val
+                    break
+            return self._cmd_set_chain_link(
+                chain=_sname(0),
+                idx=str(int(num_val)) if num_val is not None else "1",
+                value=_value(0)
+            )
+
+        if ri == _SET_LVAL:
+            # "set" "link" "value" "to" Value
+            return self._cmd_set_link_value(value=_value(0))
+
+        if ri == _SET_LVAL2:
+            # "set" "link" "value" Value
+            return self._cmd_set_link_value(value=_value(0))
+
+        if ri == _SET_INPUT_N:
+            return self._cmd_set_input(prop="name", value=_value(0))
+
+        if ri == _SET_INPUT_T:
+            return self._cmd_set_input(prop="type", value=_value(0))
+
+        if ri == _SET_COMMENT:
+            return self._cmd_set_comment(value=_value(0))
+
+        if ri == _SET_STEP:
+            # "set" "step" NUM "to" Value
+            num_val = None
+            for sym, s, e, sub in spans:
+                if sym == "NUM":
+                    num_val = tokens[s].val
+                    break
+            return self._cmd_set_step(
+                idx=str(int(num_val)) if num_val is not None else "1",
+                body=_value(0)
+            )
+
+        if ri == _SET_PATTERN:
+            return self._cmd_set_pattern(value=_value(0))
+
+        if ri == _SET_CHAIN_LIT:
+            # "set" "chain" Mname "to" Value
+            return self._cmd_set_chain_literal(name=_mname(0), values=_value(0))
+
+        if ri == _SET_BOX_VAL:
+            # "set" Sname "to" Value
+            return self._cmd_set_box_value(name=_sname(0), value=_value(0))
+
+        if ri == _SET_POSS:
+            # "set" Sname APOS Value "to" Value
+            return self._cmd_set_possessive(owner=_sname(0), prop=_value(0), value=_value(1))
+
+        if ri == _THEN:
+            return self._cmd_then(body=_value(0))
+
+        if ri == _STEP_SH:
+            # "step" NUM Value
+            num_val = None
+            for sym, s, e, sub in spans:
+                if sym == "NUM":
+                    num_val = tokens[s].val
+                    break
+            return self._cmd_step_shorthand(
+                idx=str(int(num_val)) if num_val is not None else "1",
+                body=_value(0)
+            )
+
+        if ri == _RUN_FULL:
+            # "run" Sname APOS Sname APOS Sname
+            return self._cmd_run_full(
+                palace=_sname(0), room=_sname(1), device=_sname(2), value=None
+            )
+
+        if ri == _RUN_FULL_ON:
+            # "run" Sname APOS Sname APOS Sname "on" Value
+            return self._cmd_run_full(
+                palace=_sname(0), room=_sname(1), device=_sname(2), value=_value(0)
+            )
+
+        if ri == _RUN_ROOM:
+            # "run" Sname APOS Sname
+            return self._cmd_run_room(room=_sname(0), device=_sname(1), value=None)
+
+        if ri == _RUN_ROOM_ON:
+            # "run" Sname APOS Sname "on" Value
+            return self._cmd_run_room(room=_sname(0), device=_sname(1), value=_value(0))
+
+        if ri == _RUN:
+            return self._cmd_run(device=_sname(0), value=None)
+
+        if ri == _RUN_ON:
+            return self._cmd_run(device=_sname(0), value=_value(0))
+
+        if ri == _INSTANTIATE:
+            # OptNew Sname OptCalled Sname -> type_name=sname(0), instance_name=sname(1)
+            return self._cmd_instantiate(type_name=_sname(0), instance_name=_sname(1))
+
+        raise ValueError(f"Unknown Earley rule index: {ri}")
 
     # ------------------------------------------------------------------
     # Helpers
@@ -962,42 +1499,97 @@ class IDE:
     # --- query handlers ---
 
     def _cmd_look_around(self) -> Dict:
-        items: List[tuple] = []
+        lines: List[str] = []
 
-        if self.current["device"] is not None:
-            # Inside a device: list its local boxes
+        palace   = self.current["palace"]
+        wing     = self.current["wing"]
+        room     = self.current["room"]
+        type_def = self.current["type_def"]
+        device   = self.current["device"]
+
+        # ── location header ───────────────────────────────────────────────────
+        if device is not None:
+            location = f"device {device!r}"
+            if room:    location += f" in room {room!r}"
+            if wing:    location += f" in wing {wing!r}"
+            if palace:  location += f" in palace {palace!r}"
+        elif type_def is not None:
+            location = f"type {type_def!r}"
+            if palace:  location += f" in palace {palace!r}"
+        elif room is not None:
+            location = f"room {room!r}"
+            if wing:    location += f" in wing {wing!r}"
+            if palace:  location += f" in palace {palace!r}"
+        elif wing is not None:
+            location = f"wing {wing!r}"
+            if palace:  location += f" in palace {palace!r}"
+        elif palace is not None:
+            location = f"palace {palace!r}"
+        else:
+            return {"op": "look.around", "description": "you are outside"}
+        lines.append(f"You are in {location}.")
+
+        # ── contents ──────────────────────────────────────────────────────────
+        items: List[str] = []
+
+        if device is not None:
             d = self._current_device_obj()
             if d:
-                for bname in d.get("boxes", {}):
-                    items.append(("box", bname))
-        elif self.current["type_def"] is not None:
-            # Inside a type definition: list fields and method devices
+                inp = d.get("input", {})
+                inp_name = inp.get("name") or "input"
+                inp_type = inp.get("value_type")
+                if inp_type:
+                    items.append(f"a box named {inp_name!r} (type {inp_type})")
+                else:
+                    items.append(f"a box named {inp_name!r}")
+                steps = d.get("process", [])
+                step_desc = f"{len(steps)} step{'s' if len(steps) != 1 else ''}"
+                items.append(f"a chain named 'process' with {step_desc}")
+                for bname, bobj in d.get("boxes", {}).items():
+                    btype = bobj.get("value_type")
+                    if btype:
+                        items.append(f"a box named {bname!r} (type {btype})")
+                    else:
+                        items.append(f"a box named {bname!r}")
+                if d.get("pattern"):
+                    items.append(f"a pattern: {d['pattern']!r}")
+                if d.get("comment"):
+                    items.append(f"a comment: {d['comment']!r}")
+
+        elif type_def is not None:
             td = self._current_type_def_obj()
             if td:
-                for fname in td.get("fields", {}):
-                    items.append(("box", fname))
+                for fname, fobj in td.get("fields", {}).items():
+                    ftype = fobj.get("value_type")
+                    if ftype:
+                        items.append(f"a box named {fname!r} (type {ftype})")
+                    else:
+                        items.append(f"a box named {fname!r}")
                 for dname in td.get("devices", {}):
-                    items.append(("device", dname))
-        elif self.current["room"] is not None:
-            # Inside a room: list all contents
+                    items.append(f"a device named {dname!r}")
+
+        elif room is not None:
             r = self._current_room_obj()
             if r:
-                for name, item in r.get("contents", {}).items():
-                    items.append((item.get("type", "item"), name))
-        elif self.current["palace"] is not None:
-            # Palace level: list rooms and wings
-            p = self.ast["palaces"].get(self.current["palace"], {})
-            for rname in p.get("rooms", {}):
-                items.append(("room", rname))
-            for wname in p.get("wings", {}):
-                items.append(("wing", wname))
+                for cname, cobj in r.get("contents", {}).items():
+                    ctype = cobj.get("type", "item")
+                    items.append(f"a {ctype} named {cname!r}")
 
-        if not items:
-            desc = "you see nothing"
+        elif palace is not None:
+            p = self.ast["palaces"].get(palace, {})
+            for rname in p.get("rooms", {}):
+                items.append(f"a room named {rname!r}")
+            for wname in p.get("wings", {}):
+                items.append(f"a wing named {wname!r}")
+            for tname in p.get("types", {}):
+                items.append(f"a type named {tname!r}")
+
+        if items:
+            lines.append("You see: " + ", ".join(items) + ".")
         else:
-            parts = [f"a {itype} named {iname}" for itype, iname in items]
-            desc = "you see " + " stop and ".join(parts)
-        return {"op": "look.around", "description": desc}
+            lines.append("You see nothing.")
+
+        return {"op": "look.around", "description": " ".join(lines)}
 
     def _cmd_whereami(self) -> Dict:
         return {

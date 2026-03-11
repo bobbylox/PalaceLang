@@ -141,9 +141,10 @@ class Interpreter:
             if step.startswith("return "):
                 return self._eval_expr(step[7:], palace, room_name, ctx, local)
 
-            # --- set new box (NAME | of TYPE) to EXPR ---
+            # --- set box / set new box (NAME | of TYPE) to EXPR ---
             m = (re.match(r"^set new box (\w+) to (.+)$", step) or
-                 re.match(r"^set new box of (\w+) to (.+)$", step))
+                 re.match(r"^set new box of (\w+) to (.+)$", step) or
+                 re.match(r"^set box (\w+) to (.+)$", step))
             if m:
                 box_name = m.group(1)
                 val = self._eval_expr(m.group(2), palace, room_name, ctx, local)
