@@ -1,0 +1,31 @@
+{
+  "palaces": {
+    "save": {
+      "type": "palace",
+      "rooms": {
+        "lobby": {
+          "type": "room",
+          "contents": {}
+        }
+      },
+      "wings": {
+        "scum": {
+          "type": "wing",
+          "rooms": {
+            "sewer": {
+              "type": "room",
+              "contents": {
+                "conga": {
+                  "type": "box",
+                  "value": null,
+                  "value_type": "string"
+                }
+              }
+            }
+          }
+        }
+      },
+      "types": {}
+    }
+  }
+}

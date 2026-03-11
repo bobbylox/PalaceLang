@@ -1,0 +1,15 @@
+{
+  "palaces": {
+    "home": {
+      "type": "palace",
+      "rooms": {
+        "lobby": {
+          "type": "room",
+          "contents": {}
+        }
+      },
+      "wings": {},
+      "types": {}
+    }
+  }
+}

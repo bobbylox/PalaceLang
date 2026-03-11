@@ -8,6 +8,7 @@ the AST; 'run' commands are handed to the interpreter and the result is printed.
 Type 'quit' to leave.
 """
 
+import json
 import sys
 import os
 
@@ -20,6 +21,16 @@ from Interpreter.interpreter import Interpreter
 
 def respond(msg: str):
     print(f"IDE: {msg}")
+
+
+def save_state(ast: dict):
+    palaces = ast.get("palaces", {})
+    if not palaces:
+        return
+    palace_name = next(iter(palaces))
+    filename = palace_name.replace(" ", "_") + ".json"
+    with open(filename, "w") as f:
+        json.dump(ast, f, indent=2)
 
 
 def main():
@@ -41,6 +52,7 @@ def main():
             break
 
         result = ide.process(raw)
+        save_state(ide.ast)
 
         if not result["ok"]:
             respond(result.get("error", "unrecognized"))
