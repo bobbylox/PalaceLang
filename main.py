@@ -61,21 +61,43 @@ def main():
                 continue
 
             palaces = ide.ast.get("palaces", {})
-            r = palaces.get(palace, {}).get("rooms", {}).get(room, {})
-            if device not in r.get("devices", {}):
+            palace_obj = palaces.get(palace, {})
+            r = palace_obj.get("rooms", {}).get(room)
+            if r is None:
+                for wing_obj in palace_obj.get("wings", {}).values():
+                    r = wing_obj.get("rooms", {}).get(room)
+                    if r is not None:
+                        break
+            r = r or {}
+            contents = r.get("contents", {})
+            if device not in contents or contents[device].get("type") != "device":
                 respond(f"no device {device}")
                 continue
 
-            dev_meta = r["devices"][device]
-            if (value is None
-                    and dev_meta.get("input", {}).get("type", "untyped")
-                    != "untyped"):
-                input_type = dev_meta["input"].get("type", "unknown")
-                respond(f"{device} requires an input of type {input_type}")
+            dev_meta = contents[device]
+            input_value_type = dev_meta.get("input", {}).get("value_type")
+            if value is None and input_value_type is not None:
+                respond(f"{device} requires an input of type {input_value_type}")
                 continue
 
             try:
                 out = interp.run_device(palace, room, device, value)
+                respond(str(out))
+            except Exception as e:
+                respond(f"error — {e}")
+            continue
+
+        if op == "run.instance":
+            palace = action.get("palace")
+            room_name = action.get("room_name", "lobby")
+            instance = action["instance"]
+            device = action["device"]
+            input_val = action.get("input")
+            if palace is None:
+                respond("not inside a palace")
+                continue
+            try:
+                out = interp.run_instance_device(palace, room_name, instance, device, input_val)
                 respond(str(out))
             except Exception as e:
                 respond(f"error — {e}")
@@ -88,6 +110,8 @@ def main():
                 parts.append(f"device {action['device']}")
             if action.get("room"):
                 parts.append(f"room {action['room']}")
+            if action.get("wing"):
+                parts.append(f"wing {action['wing']}")
             if action.get("palace"):
                 parts.append(f"palace {action['palace']}")
             respond(", ".join(parts) if parts else "outside")

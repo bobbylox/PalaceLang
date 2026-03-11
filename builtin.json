@@ -1,0 +1,203 @@
+{
+    "comment": "Palace Language built-in type system. Each entry describes the schema for one type. '_defaults' holds the simplified AST-level initial values used by the parser. '_value_types' lists the scalar types accepted as box value-type constraints.",
+
+    "_value_types": ["boolean", "number", "integer", "string"],
+
+    "_defaults": {
+        "palace":  { "type": "palace", "rooms": {}, "wings": {}, "types": {} },
+        "wing":    { "type": "wing", "rooms": {} },
+        "room":    { "type": "room", "contents": {} },
+        "type_def": {"type": "type_def", "parent": "bag", "fields": {}, "devices": {}},
+        "device":  {
+            "type":    "device",
+            "input":   { "name": "input", "value_type": null, "value": null },
+            "process": [],
+            "pattern": null,
+            "comment": "",
+            "boxes":   {}
+        },
+        "chain":   { "type": "chain", "value_type": null, "links": [] },
+        "link":    { "type": "link", "name": null, "value": null },
+        "box":     { "type": "box", "name": null, "value_type": null, "value": null },
+        "bag":     { "type": "bag", "name": null, "value_type": null, "data": {} }
+    },
+
+    "boolean": {
+        "type": "boolean"
+    },
+
+    "number": {
+        "type": "number"
+    },
+
+    "integer": {
+        "type": "integer",
+        "parent": "number"
+    },
+
+    "string": {
+        "type": "string",
+        "parent": "chain",
+        "value_type": "integer",
+        "comment": "A string is a chain whose links hold integer character codes."
+    },
+
+    "link": {
+        "type": "link",
+        "name": null,
+        "value": null,
+        "value_type": null,
+        "comment": "A single node in a chain. value_type mirrors the containing chain's value_type."
+    },
+
+    "chain": {
+        "type": "chain",
+        "name": null,
+        "value_type": null,
+        "links": [],
+        "comment": "An ordered linked sequence. value_type constrains every link's value.",
+        "get": {
+            "type": "device",
+            "input": { "name": "index", "value_type": "integer" },
+            "return_type": "link"
+        },
+        "insert": {
+            "type": "device",
+            "input": { "name": "index", "value_type": "integer" }
+        },
+        "remove": {
+            "type": "device",
+            "input": { "name": "index", "value_type": "integer" }
+        },
+        "length": {
+            "type": "device",
+            "return_type": "integer"
+        }
+    },
+
+    "box": {
+        "type": "box",
+        "name": null,
+        "value_type": null,
+        "value": null,
+        "comment": "A named variable. value_type optionally constrains what may be stored.",
+        "get": {
+            "type": "device",
+            "return_type": null
+        },
+        "set": {
+            "type": "device",
+            "input": { "name": "value", "value_type": null }
+        }
+    },
+
+    "bag": {
+        "type": "bag",
+        "name": null,
+        "value_type": null,
+        "data": {},
+        "comment": "An unordered key-value container (equivalent to object / dictionary). value_type optionally constrains stored values.",
+        "get": {
+            "type": "device",
+            "input": { "name": "key", "value_type": "string" },
+            "return_type": null
+        },
+        "set": {
+            "type": "device",
+            "input": { "name": "key", "value_type": "string" }
+        },
+        "has": {
+            "type": "device",
+            "input": { "name": "key", "value_type": "string" },
+            "return_type": "boolean"
+        },
+        "remove": {
+            "type": "device",
+            "input": { "name": "key", "value_type": "string" }
+        }
+    },
+
+    "command": {
+        "type": "command",
+        "name": null,
+        "body": null,
+        "comment": "A single step in a device's process. body is the raw utterance string."
+    },
+
+    "device": {
+        "type": "device",
+        "name": null,
+        "comment": "",
+        "return_type": null,
+        "input": {
+            "type": "box",
+            "name": "input",
+            "value_type": null,
+            "value": null
+        },
+        "process": {
+            "type": "chain",
+            "value_type": "command",
+            "links": []
+        },
+        "pattern": {
+            "type": "chain",
+            "value_type": "command",
+            "links": [],
+            "comment": "Optional pattern-match rules for dispatch, analogous to function overloading."
+        },
+        "boxes": {
+            "type": "bag",
+            "value_type": "box",
+            "data": {}
+        }
+    },
+
+    "room": {
+        "type": "room",
+        "name": null,
+        "comment": "",
+        "chains": {
+            "type": "bag",
+            "value_type": "chain",
+            "data": {}
+        },
+        "devices": {
+            "type": "bag",
+            "value_type": "device",
+            "data": {}
+        },
+        "boxes": {
+            "type": "bag",
+            "value_type": "box",
+            "data": {}
+        }
+    },
+
+    "wing": {
+        "type": "wing",
+        "name": null,
+        "comment": "",
+        "rooms": {
+            "type": "bag",
+            "value_type": "room",
+            "data": {}
+        }
+    },
+
+    "palace": {
+        "type": "palace",
+        "name": null,
+        "comment": "",
+        "rooms": {
+            "type": "bag",
+            "value_type": "room",
+            "data": {}
+        },
+        "wings": {
+            "type": "bag",
+            "value_type": "wing",
+            "data": {}
+        }
+    }
+}
