@@ -629,6 +629,92 @@ class TestPossessiveSet(unittest.TestCase):
 
 
 # ---------------------------------------------------------------------------
+# 7b. Set-box sugar: "set NAME to VALUE" and "set box NAME (stop) to VALUE"
+# ---------------------------------------------------------------------------
+
+class TestSetBoxSugar(unittest.TestCase):
+    """'set coin to true' and 'set box dice stop to 8' are sugar for the possessive form."""
+
+    def setUp(self):
+        self.ide, self.interp, self.repl = make_repl()
+        self.repl("palace test")
+        self.repl("enter lobby")
+
+    def _lobby(self):
+        return self.ide.ast["palaces"]["test"]["rooms"]["lobby"]
+
+    # --- set NAME to VALUE (room-level box) ---
+
+    def test_set_name_to_value_bool(self):
+        self.repl("box coin")
+        self.assertEqual(self.repl("set coin to true"), "yes")
+        self.assertEqual(self._lobby()["contents"]["coin"]["value"], True)
+
+    def test_set_name_to_value_integer(self):
+        self.repl("box of integers score stop")
+        self.assertEqual(self.repl("set score to 42"), "yes")
+        self.assertEqual(self._lobby()["contents"]["score"]["value"], 42)
+
+    def test_set_name_to_value_string(self):
+        self.repl("box of strings label stop")
+        self.assertEqual(self.repl("set label to hello stop"), "yes")
+        self.assertEqual(self._lobby()["contents"]["label"]["value"], "hello")
+
+    def test_set_name_to_value_device_box(self):
+        self.repl("device calc")
+        self.repl("enter calc")
+        self.repl("box result")
+        self.assertEqual(self.repl("set result to 7"), "yes")
+        contents = self.ide.ast["palaces"]["test"]["rooms"]["lobby"]["contents"]
+        self.assertEqual(contents["calc"]["boxes"]["result"]["value"], 7)
+
+    def test_set_name_errors_if_not_box(self):
+        self.repl("chain log")
+        r = self.repl("set log to 5")
+        self.assertIn("not a box", r)
+
+    def test_set_name_errors_if_not_found(self):
+        r = self.repl("set ghost to 5")
+        self.assertIn("cannot find", r)
+
+    # --- set box NAME (stop) to VALUE ---
+
+    def test_set_box_name_to_value(self):
+        self.repl("box dice")
+        self.assertEqual(self.repl("set box dice to 8"), "yes")
+        self.assertEqual(self._lobby()["contents"]["dice"]["value"], 8)
+
+    def test_set_box_name_stop_to_value(self):
+        self.repl("box of integers dice stop")
+        self.assertEqual(self.repl("set box dice stop to 8"), "yes")
+        self.assertEqual(self._lobby()["contents"]["dice"]["value"], 8)
+
+    def test_set_box_multi_word_name(self):
+        self.repl("box fiddly dee stop")
+        self.assertEqual(self.repl("set box fiddly dee stop to 99"), "yes")
+        self.assertEqual(self._lobby()["contents"]["fiddly dee"]["value"], 99)
+
+    def test_set_box_name_errors_if_not_box(self):
+        self.repl("chain sequence")
+        r = self.repl("set box sequence to 0")
+        self.assertIn("not a box", r)
+
+    def test_set_box_name_errors_if_not_found(self):
+        r = self.repl("set box phantom to 1")
+        self.assertIn("cannot find", r)
+
+    # --- set box of TYPE to VALUE still works (not broken by new pattern) ---
+
+    def test_set_box_of_type_unaffected(self):
+        # _type_of_value maps int/float → "number", so use "number" type here
+        self.assertEqual(self.repl("set box of number to 5"), "yes")
+        anon = [v for v in self._lobby()["contents"].values()
+                if v.get("type") == "box" and v.get("value_type") == "number"]
+        self.assertEqual(len(anon), 1)
+        self.assertEqual(anon[0]["value"], 5)
+
+
+# ---------------------------------------------------------------------------
 # 8. User-defined types
 # ---------------------------------------------------------------------------
 

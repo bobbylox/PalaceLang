@@ -140,6 +140,11 @@ def main():
             respond("noted")
             continue
 
+        # ---- raw arithmetic expression -----------------------------------
+        if op == "expr.result":
+            respond(str(action["value"]))
+            continue
+
         # ---- default: anything else is "yes" -----------------------------
         respond("yes")
 

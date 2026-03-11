@@ -200,7 +200,7 @@ class IDE:
             (r"^device (?P<name>\w+)(?: stop)?$", self._cmd_create_device),
             (r"^box (?P<name>\w+) of (?P<btype>\w+)(?: stop)?$", self._cmd_box_typed),
             (r"^box of (?P<btype>\w+)(?: (?P<name>.+?))?(?: stop)?$", self._cmd_box_typed),
-            (r"^box (?P<name>\w+)(?: stop)?$", self._cmd_box),
+            (r"^box (?P<name>.+?)(?: stop)?$", self._cmd_box),
             (r"^type (?P<name>\w+)(?: stop)?$", self._cmd_type),
 
             # --- Append ---
@@ -211,10 +211,10 @@ class IDE:
             # --- Set (specific → general) ---
             (r"^set box of (?P<btype>\w+) to (?P<value>.+)$",
              self._cmd_set_box_typed),
+            (r"^set box (?P<name>.+?)(?: stop)? to (?P<value>.+)$",
+             self._cmd_set_box_value_named),
             (r"^set (?P<chain>\w+)(?:'s)? link (?P<idx>\d+) to (?P<value>.+)$",
              self._cmd_set_chain_link),
-            (r"^set (?P<owner>\w+)'s (?P<prop>.+?) to (?P<value>.+)$",
-             self._cmd_set_possessive),
             (r"^set link value (?:to )?(?P<value>.+)$",
              self._cmd_set_link_value),
             (r"^set input (?P<prop>name|type) to (?P<value>.+)$", self._cmd_set_input),
@@ -222,7 +222,9 @@ class IDE:
             (r"^set step (?P<idx>\d+) to (?P<body>.+)$", self._cmd_set_step),
             (r"^set pattern to (?P<value>.+)$", self._cmd_set_pattern),
             (r"^set chain (?P<name>.+?) to (?P<values>.+)$", self._cmd_set_chain_literal),
-            (r"^set (?P<instance>\w+) (?P<field>\w+) to (?P<value>.+)$", self._cmd_set_instance_field),
+            (r"^set (?P<name>\w+) to (?P<value>.+)$", self._cmd_set_box_value),
+            (r"^set (?P<owner>\w+)(?:'s)? (?P<prop>.+?) to (?P<value>.+)$",
+             self._cmd_set_possessive),
 
             # --- Then (step-append sugar) ---
             (r"^then (?P<body>.+)$", self._cmd_then),
@@ -234,7 +236,7 @@ class IDE:
             (r"^run (?P<room>\w+)'s? (?P<device>\w+)(?: on (?P<value>.+))?$",
              self._cmd_run_room),
             (r"^run (?P<device>\w+)(?: on (?P<value>.+))?$", self._cmd_run),
-            (r"^(?P<type_name>\w+) (?P<instance_name>\w+)(?: stop)?$", self._cmd_instantiate),
+            (r"^(?P<type_name>[a-zA-Z]\w*) (?P<instance_name>[a-zA-Z]\w*)(?: stop)?$", self._cmd_instantiate),
         ]
 
         for pat, fn in patterns:
@@ -260,6 +262,15 @@ class IDE:
         action = self._try_type_patterns(t)
         if action is not None:
             return {"ok": True, "action": action}
+
+        # last resort: try as a raw arithmetic expression
+        try:
+            v = self._eval_arith(t)
+            if isinstance(v, float) and v.is_integer():
+                v = int(v)
+            return {"ok": True, "action": {"op": "expr.result", "value": v}}
+        except (ValueError, TypeError, ZeroDivisionError):
+            pass
         return {"ok": False, "error": f"unrecognized: {t}"}
 
     # ------------------------------------------------------------------
@@ -514,6 +525,62 @@ class IDE:
         self._ensure_room(palace, name, self.current["wing"])
         return {"op": "room.create", "name": name}
 
+    def _eval_arith(self, s: str):
+        """Evaluate a pure Palace arithmetic expression.  No variable lookup.
+        Raises ValueError if the string cannot be fully parsed as an expression.
+        Operator precedence (low → high): comparison < plus/minus < times/divided by
+        < squared/cubed.  Minus is left-associative via rsplit.
+        """
+        s = s.strip()
+        # comparisons (lowest precedence)
+        for op_str, fn in [
+            ("is less than",   lambda a, b: a < b),
+            ("is greater than", lambda a, b: a > b),
+            ("is equal to",    lambda a, b: a == b),
+        ]:
+            if f" {op_str} " in s:
+                left, right = s.split(f" {op_str} ", 1)
+                return fn(self._eval_arith(left), self._eval_arith(right))
+        # addition
+        if " plus " in s:
+            return sum(self._eval_arith(p) for p in s.split(" plus "))
+        # subtraction — rsplit gives left-associativity: a-b-c = (a-b)-c
+        if " minus " in s:
+            left, right = s.rsplit(" minus ", 1)
+            return self._eval_arith(left) - self._eval_arith(right)
+        # multiplication
+        if " times " in s:
+            result = 1
+            for p in s.split(" times "):
+                result *= self._eval_arith(p)
+            return result
+        # division
+        if " divided by " in s:
+            left, right = s.split(" divided by ", 1)
+            denom = self._eval_arith(right)
+            if denom == 0:
+                raise ZeroDivisionError("division by zero")
+            return self._eval_arith(left) / denom
+        # postfix powers (highest arithmetic precedence)
+        if s.endswith(" squared"):
+            return self._eval_arith(s[:-8]) ** 2
+        if s.endswith(" cubed"):
+            return self._eval_arith(s[:-6]) ** 3
+        # literals
+        try:
+            return int(s)
+        except ValueError:
+            pass
+        try:
+            return float(s)
+        except ValueError:
+            pass
+        if s.lower() == "true":
+            return True
+        if s.lower() == "false":
+            return False
+        raise ValueError(f"not an expression: {s!r}")
+
     def _normalize_type(self, s: str) -> str:
         """Accept plural forms like 'numbers' → 'number'."""
         if s in VALUE_TYPES:
@@ -618,6 +685,25 @@ class IDE:
         scope = self._place_box(name, {"type": "box", "value": None, "value_type": btype})
         self._last_box = name
         return {"op": "box.create", "name": name, "value_type": btype, "scope": scope}
+
+    def _cmd_set_box_value(self, name: str, value: str) -> Dict:
+        """Sugar: 'set NAME to VALUE' → set NAME's value to VALUE (when NAME is a box)."""
+        obj = self._resolve_owner(name)
+        if obj is None:
+            return {"error": f"cannot find {name!r}"}
+        if obj.get("type") != "box":
+            return {"error": f"{name!r} is not a box"}
+        return self._cmd_set_possessive(name, "value", value)
+
+    def _cmd_set_box_value_named(self, name: str, value: str) -> Dict:
+        """Sugar: 'set box NAME (stop) to VALUE' → set NAME's value to VALUE."""
+        name = self._strip_stop(name.strip())
+        obj = self._resolve_owner(name)
+        if obj is None:
+            return {"error": f"cannot find {name!r}"}
+        if obj.get("type") != "box":
+            return {"error": f"{name!r} is not a box"}
+        return self._cmd_set_possessive(name, "value", value)
 
     def _cmd_set_box_typed(self, btype: str, value: str) -> Dict:
         if btype not in VALUE_TYPES:
@@ -760,6 +846,13 @@ class IDE:
         prop = prop.strip().lower()
         field = _PROP_MAP.get(prop)
         if field is None:
+            # Could be a user-type instance field (e.g. "set rect width to 5").
+            # Only delegate if the owner is a user-type instance (not a built-in sub-object).
+            if " " not in prop:
+                r = self._current_room_obj()
+                item = r.get("contents", {}).get(owner) if r else None
+                if item is not None and item.get("type") not in _BUILTIN_TYPES:
+                    return self._cmd_set_instance_field(owner, prop, value)
             return {"error": f"unknown property {prop!r}"}
         obj = self._resolve_owner(owner)
         if obj is None:

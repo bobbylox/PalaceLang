@@ -287,18 +287,7 @@ class Interpreter:
                 if 0 <= i0 < len(links):
                     return links[i0].get("value")
 
-        # multiplication
-        if " times " in s:
-            parts = s.split(" times ")
-            result = None
-            for p in parts:
-                v = self._eval_expr(p, palace, room_name, ctx, local)
-                if v is None:
-                    return None
-                result = v if result is None else result * v
-            return result
-
-        # comparison operators (must come before arithmetic)
+        # comparison operators (lowest precedence)
         for op_str, op_fn in [
             ("is less than", lambda a, b: a < b),
             ("is greater than", lambda a, b: a > b),
@@ -320,13 +309,40 @@ class Interpreter:
             if all(v is not None for v in vals):
                 return sum(vals)
 
-        # subtraction (split on last " minus " to handle e.g. "input minus 2")
+        # subtraction — rsplit for left-associativity: a-b-c = (a-b)-c
         if " minus " in s:
-            a, b = s.split(" minus ", 1)
+            a, b = s.rsplit(" minus ", 1)
             av = self._eval_expr(a, palace, room_name, ctx, local)
             bv = self._eval_expr(b, palace, room_name, ctx, local)
             if av is not None and bv is not None:
                 return av - bv
+
+        # multiplication
+        if " times " in s:
+            parts = s.split(" times ")
+            result = None
+            for p in parts:
+                v = self._eval_expr(p, palace, room_name, ctx, local)
+                if v is None:
+                    return None
+                result = v if result is None else result * v
+            return result
+
+        # division
+        if " divided by " in s:
+            a, b = s.split(" divided by ", 1)
+            av = self._eval_expr(a, palace, room_name, ctx, local)
+            bv = self._eval_expr(b, palace, room_name, ctx, local)
+            if av is not None and bv is not None and bv != 0:
+                return av / bv
+
+        # postfix powers (highest arithmetic precedence)
+        if s.endswith(" squared"):
+            v = self._eval_expr(s[:-8], palace, room_name, ctx, local)
+            return v ** 2 if v is not None else None
+        if s.endswith(" cubed"):
+            v = self._eval_expr(s[:-6], palace, room_name, ctx, local)
+            return v ** 3 if v is not None else None
 
         return None
 
