@@ -29,10 +29,43 @@ _PROP_MAP: Dict[str, str] = {
     "name":       "name",
 }
 
+# Structural (non-user-settable) keys for each type, derived from BUILTIN.
+# A key is structural if its value in the type definition is itself a typed
+# sub-object (a dict with a "type" key) — these represent the fixed architecture
+# of the type and must not be mutated or renamed by the user.
+_STRUCTURAL_KEYS: Dict[str, frozenset] = {
+    type_name: frozenset(
+        k for k, v in type_def.items()
+        if isinstance(v, dict) and "type" in v
+    )
+    for type_name, type_def in BUILTIN.items()
+    if not type_name.startswith("_") and isinstance(type_def, dict)
+}
+
 # Builtin type names — used to distinguish user-type instances from builtins.
 _BUILTIN_TYPES = frozenset({
     "palace", "wing", "room", "device", "chain", "box", "bag", "type_def", "link"
 })
+
+# Maps action op prefixes to the kind of object whose name should be recorded
+# in _last_by_type.  Checked in order; first prefix match wins.
+_OP_TO_KIND: List[Tuple[str, str]] = [
+    ("palace",      "palace"),
+    ("enter.palace","palace"),
+    ("enter.wing",  "wing"),
+    ("wing",        "wing"),
+    ("enter.room",  "room"),
+    ("room",        "room"),
+    ("enter.device","device"),
+    ("device",      "device"),
+    ("chain",       "chain"),
+    ("bag",         "bag"),
+    ("box",         "box"),
+    ("enter.type",  "type"),
+    ("type",        "type"),
+    ("enter.instance", "instance"),
+    ("instance",    "instance"),
+]
 
 
 class IDE:
@@ -46,9 +79,10 @@ class IDE:
         self.ast: Dict[str, Any] = {"palaces": {}}
         self.current = {
             "palace": None, "wing": None, "room": None,
-            "type_def": None, "device": None, "in_process": False
+            "type_def": None, "instance": None, "device": None, "process_chain": None
         }
-        self._last_name: Optional[str] = None      # for "it" pronoun
+        # Clipboard: tracks the last name seen overall ("it") and per type ("the room" etc.)
+        self._last_by_type: Dict[str, str] = {}
         self._last_link_chain: Optional[str] = None  # for "set link value"
         self._last_box: Optional[str] = None          # for "box of TYPE" references
         self._box_counter: int = 0                    # auto-names anonymous boxes
@@ -123,9 +157,13 @@ class IDE:
         if t.endswith(" over"):
             t = t[:-5].strip()
         # "stop" is a string-end marker — handled at the value level, NOT here
-        # resolve "it" pronoun
-        if self._last_name:
-            t = re.sub(r'\bit\b', self._last_name, t, flags=re.IGNORECASE)
+        # resolve "it" pronoun and "the TYPE" references
+        if self._last_by_type.get("it"):
+            t = re.sub(r'\bit\b', self._last_by_type["it"], t, flags=re.IGNORECASE)
+        def _replace_the(m: re.Match) -> str:
+            kind = m.group(1).lower()
+            return self._last_by_type.get(kind, m.group(0))
+        t = re.sub(r'\bthe (\w+)\b', _replace_the, t, flags=re.IGNORECASE)
         return t
 
     # ------------------------------------------------------------------
@@ -137,6 +175,7 @@ class IDE:
 
         patterns: List[Tuple[str, Any]] = [
             # --- Queries (most specific first) ---
+            (r"^look around$", self._cmd_look_around),
             (r"^where am [Ii]\?*$", self._cmd_whereami),
             (r"^what is (?:the )?step length\??$", self._cmd_step_length),
             (r"^what is (?:the )?(?P<value_of>value of )?(?P<chain>\w+)(?:'s)? link (?P<idx>\d+)\??$",
@@ -146,8 +185,8 @@ class IDE:
 
             # --- Palace & navigation ---
             (r"^palace (?:called |named )?(?P<name>\w+)(?: stop)?$", self._cmd_palace),
-            (r"^enter (?:new )?device (?P<name>\w+)(?: stop)?$", self._cmd_device),
-            (r"^enter process$", self._cmd_enter_process),
+            (r"^enter (?:new )?(?P<kind>\w+) (?P<name>.+?)(?: stop)?$",
+             self._cmd_enter_typed),
             (r"^enter (?P<name>\w+)(?: stop)?$", self._cmd_enter),
             (r"^go to (?P<name>\w+)(?: stop)?$", self._cmd_go_to),
             (r"^go outside$", self._cmd_go_outside),
@@ -156,14 +195,11 @@ class IDE:
             # --- Creation ---
             (r"^wing (?P<name>\w+)(?: stop)?$", self._cmd_wing),
             (r"^room (?P<name>\w+)(?: stop)?$", self._cmd_room),
-            (r"^chain of (?P<btype>\w+) (?P<name>.+)$", self._cmd_chain_typed),
-            (r"^chain (?P<name>\w+)(?: stop)?$", self._cmd_chain),
-            (r"^bag of (?P<btype>\w+) (?P<name>.+)$", self._cmd_bag_typed),
-            (r"^bag (?P<name>\w+)(?: stop)?$", self._cmd_bag),
+            (r"^chain(?: of (?P<btype>\w+))? (?P<name>.+?)(?: stop)?$", self._cmd_chain),
+            (r"^bag(?: of (?P<btype>\w+))? (?P<name>.+?)(?: stop)?$", self._cmd_bag),
             (r"^device (?P<name>\w+)(?: stop)?$", self._cmd_create_device),
-            (r"^box (?P<name>\w+) of (?P<btype>\w+)(?: stop)?$", self._cmd_box_named_typed),
-            (r"^box of (?P<btype>\w+) (?P<name>.+)$", self._cmd_box_of_type_named),
-            (r"^box of (?P<btype>\w+)(?: stop)?$", self._cmd_box_anon_typed),
+            (r"^box (?P<name>\w+) of (?P<btype>\w+)(?: stop)?$", self._cmd_box_typed),
+            (r"^box of (?P<btype>\w+)(?: (?P<name>.+?))?(?: stop)?$", self._cmd_box_typed),
             (r"^box (?P<name>\w+)(?: stop)?$", self._cmd_box),
             (r"^type (?P<name>\w+)(?: stop)?$", self._cmd_type),
 
@@ -181,11 +217,11 @@ class IDE:
              self._cmd_set_possessive),
             (r"^set link value (?:to )?(?P<value>.+)$",
              self._cmd_set_link_value),
-            (r"^set input name to (?P<value>.+)$", self._cmd_set_input_name),
-            (r"^set input type to (?P<value>.+)$", self._cmd_set_input_type),
+            (r"^set input (?P<prop>name|type) to (?P<value>.+)$", self._cmd_set_input),
             (r"^set comment to (?P<value>.+)$", self._cmd_set_comment),
             (r"^set step (?P<idx>\d+) to (?P<body>.+)$", self._cmd_set_step),
             (r"^set pattern to (?P<value>.+)$", self._cmd_set_pattern),
+            (r"^set chain (?P<name>.+?) to (?P<values>.+)$", self._cmd_set_chain_literal),
             (r"^set (?P<instance>\w+) (?P<field>\w+) to (?P<value>.+)$", self._cmd_set_instance_field),
 
             # --- Then (step-append sugar) ---
@@ -207,7 +243,16 @@ class IDE:
                 res = fn(**m.groupdict())
                 if isinstance(res, dict):
                     if "name" in res:
-                        self._last_name = res["name"]
+                        name = res["name"]
+                        self._last_by_type["it"] = name
+                        op = res.get("op", "")
+                        for prefix, kind in _OP_TO_KIND:
+                            if op.startswith(prefix):
+                                self._last_by_type[kind] = name
+                                # instance.create also records under its user type name
+                                if kind == "instance" and "type" in res:
+                                    self._last_by_type[res["type"]] = name
+                                break
                     if "error" in res:
                         return {"ok": False, "error": res["error"]}
                 return {"ok": True, "action": res}
@@ -268,16 +313,30 @@ class IDE:
         self._ensure_room(name, "lobby")   # every palace starts with lobby
         self.current = {
             "palace": name, "wing": None, "room": None,
-            "type_def": None, "device": None, "in_process": False
+            "type_def": None, "instance": None, "device": None, "process_chain": None
         }
         return {"op": "palace.create", "name": name}
 
     def _cmd_enter(self, name: str) -> Dict:
+        # enter a command chain? (must be in a device to redirect its process)
+        if self._current_device_obj() is not None:
+            if name == "process":
+                self.current["process_chain"] = "process"
+                return {"op": "enter.process", "chain": "process"}
+            r = self._current_room_obj()
+            if r is not None:
+                ch = r.get("contents", {}).get(name)
+                if ch and ch.get("type") == "chain" and ch.get("value_type") == "command":
+                    self.current["process_chain"] = name
+                    return {"op": "enter.process", "chain": name}
+        elif name == "process":
+            return {"error": "not in a device"}
+
         # enter a palace?
         if name in self.ast["palaces"]:
             self.current = {
                 "palace": name, "wing": None, "room": None,
-                "type_def": None, "device": None, "in_process": False
+                "type_def": None, "instance": None, "device": None, "process_chain": None
             }
             return {"op": "enter.palace", "name": name}
 
@@ -290,18 +349,18 @@ class IDE:
         # If inside a type_def, check for method devices in that type
         td = self._current_type_def_obj()
         if td is not None and name in td.get("devices", {}):
-            self.current.update({"device": name, "in_process": False})
+            self.current.update({"device": name, "process_chain": None})
             return {"op": "enter.device", "name": name}
 
         # enter a type definition?
         if name in palace_obj.get("types", {}):
-            self.current.update({"type_def": name, "device": None, "in_process": False})
+            self.current.update({"type_def": name, "device": None, "process_chain": None})
             return {"op": "enter.type_def", "name": name}
 
         # enter a wing?
         if name in palace_obj.get("wings", {}):
             self.current.update({"wing": name, "room": None,
-                                 "device": None, "in_process": False})
+                                 "device": None, "process_chain": None})
             return {"op": "enter.wing", "name": name}
 
         # enter an existing room? (current wing first, then palace-level)
@@ -312,26 +371,82 @@ class IDE:
 
         if name in wing_rooms:
             self.current.update({"room": name, "device": None,
-                                 "in_process": False})
+                                 "process_chain": None})
             return {"op": "enter.room", "name": name}
 
         if name in palace_rooms:
             self.current.update({"wing": None, "room": name,
-                                 "device": None, "in_process": False})
+                                 "device": None, "process_chain": None})
             return {"op": "enter.room", "name": name}
 
         # enter an existing device in the current room?
         r = self._current_room_obj()
         if (r is not None and name in r.get("contents", {})
                 and r["contents"][name].get("type") == "device"):
-            self.current.update({"device": name, "in_process": False})
+            self.current.update({"device": name, "process_chain": None})
             return {"op": "enter.device", "name": name}
 
         # implicitly create a new room (in current wing if any)
         self._ensure_room(palace, name, wing)
         self.current.update({"room": name, "device": None,
-                             "in_process": False})
+                             "process_chain": None})
         return {"op": "enter.room.create", "name": name}
+
+    def _cmd_enter_typed(self, kind: str, name: str) -> Dict:
+        kind = kind.lower()
+        name = name.strip()
+
+        if kind == "palace":
+            self._ensure_palace(name)
+            self._ensure_room(name, "lobby")
+            self.current = {
+                "palace": name, "wing": None, "room": "lobby",
+                "type_def": None, "instance": None, "device": None, "process_chain": None
+            }
+            return {"op": "enter.palace", "name": name}
+
+        palace = self.current["palace"]
+        if palace is None:
+            return {"error": "no palace"}
+
+        if kind == "wing":
+            self._ensure_wing(palace, name)
+            self.current.update({"wing": name, "room": None, "type_def": None,
+                                 "instance": None, "device": None, "process_chain": None})
+            return {"op": "enter.wing", "name": name}
+
+        if kind == "room":
+            wing = self.current["wing"]
+            self._ensure_room(palace, name, wing)
+            self.current.update({"room": name, "type_def": None,
+                                 "instance": None, "device": None, "process_chain": None})
+            return {"op": "enter.room", "name": name}
+
+        if kind == "device":
+            return self._cmd_device(name)
+
+        if kind == "type":
+            palace_obj = self.ast["palaces"][palace]
+            palace_obj.setdefault("types", {}).setdefault(name, _default("type_def"))
+            self.current.update({"type_def": name, "instance": None,
+                                 "device": None, "process_chain": None})
+            return {"op": "enter.type_def", "name": name}
+
+        # user-defined type instance
+        palace_obj = self.ast["palaces"][palace]
+        if kind in palace_obj.get("types", {}):
+            r = self._current_room_obj()
+            if r is None:
+                return {"error": "no room"}
+            type_def = palace_obj["types"][kind]
+            r["contents"].setdefault(name, {
+                "type": kind,
+                "fields": copy.deepcopy(type_def.get("fields", {})),
+            })
+            self.current.update({"instance": name, "device": None, "process_chain": None})
+            return {"op": "enter.instance", "name": name, "type": kind}
+
+        return {"error": f"cannot enter {kind!r}"}
 
     def _cmd_go_to(self, name: str) -> Dict:
         palace = self.current["palace"]
@@ -342,14 +457,14 @@ class IDE:
         # check palace-level rooms
         if name in palace_obj.get("rooms", {}):
             self.current.update({"wing": None, "room": name,
-                                 "device": None, "in_process": False})
+                                 "device": None, "process_chain": None})
             return {"op": "go.room", "name": name}
 
         # check all wings' rooms
         for wing_name, wing_obj in palace_obj.get("wings", {}).items():
             if name in wing_obj.get("rooms", {}):
                 self.current.update({"wing": wing_name, "room": name,
-                                     "device": None, "in_process": False})
+                                     "device": None, "process_chain": None})
                 return {"op": "go.room", "name": name}
 
         return {"error": f"no room {name}"}
@@ -357,17 +472,20 @@ class IDE:
     def _cmd_go_outside(self) -> Dict:
         self.current = {
             "palace": None, "wing": None, "room": None,
-            "device": None, "in_process": False
+            "type_def": None, "instance": None, "device": None, "process_chain": None
         }
         return {"op": "go.outside"}
 
     def _cmd_exit(self) -> Dict:
-        if self.current["in_process"]:
-            self.current["in_process"] = False
+        if self.current["process_chain"] is not None:
+            self.current["process_chain"] = None
             return {"op": "exit.process"}
         if self.current["device"] is not None:
             self.current["device"] = None
             return {"op": "exit.device"}
+        if self.current["instance"] is not None:
+            self.current["instance"] = None
+            return {"op": "exit.instance"}
         if self.current["type_def"] is not None:
             self.current["type_def"] = None
             return {"op": "exit.type_def"}
@@ -404,24 +522,29 @@ class IDE:
             return s[:-1]
         return s
 
-    def _cmd_chain_typed(self, btype: str, name: str) -> Dict:
+
+    def _cmd_chain(self, name: str, btype: str = None) -> Dict:
         palace = self.current["palace"]
-        room = self.current["room"]
         if palace is None:
             return {"error": "no palace"}
+        room = self.current["room"]
         if room is None:
             return {"error": "chain must be in a room"}
         name = self._strip_stop(name.strip())
-        btype = self._normalize_type(btype)
-        if btype not in VALUE_TYPES:
-            return {"error": f"unknown type {btype!r} — valid types: {', '.join(VALUE_TYPES)}"}
         r = self._ensure_room(palace, room, self.current["wing"])
         ch = r["contents"].setdefault(name, _default("chain"))
-        ch["value_type"] = btype
+        if btype is not None:
+            btype = self._normalize_type(btype)
+            if btype not in VALUE_TYPES and btype != "command":
+                return {"error": f"unknown type {btype!r}"}
+            ch["value_type"] = btype
         self._last_link_chain = name
-        return {"op": "chain.create", "name": name, "value_type": btype}
+        result: Dict = {"op": "chain.create", "name": name}
+        if btype is not None:
+            result["value_type"] = btype
+        return result
 
-    def _cmd_bag_typed(self, btype: str, name: str) -> Dict:
+    def _cmd_bag(self, name: str, btype: str = None) -> Dict:
         palace = self.current["palace"]
         room = self.current["room"]
         if palace is None:
@@ -429,47 +552,17 @@ class IDE:
         if room is None:
             return {"error": "bag must be in a room"}
         name = self._strip_stop(name.strip())
-        btype = self._normalize_type(btype)
-        if btype not in VALUE_TYPES:
-            return {"error": f"unknown type {btype!r} — valid types: {', '.join(VALUE_TYPES)}"}
         r = self._ensure_room(palace, room, self.current["wing"])
         bg = r["contents"].setdefault(name, _default("bag"))
-        bg["value_type"] = btype
-        return {"op": "bag.create", "name": name, "value_type": btype}
-
-    def _cmd_box_of_type_named(self, btype: str, name: str) -> Dict:
-        name = self._strip_stop(name.strip())
-        btype = self._normalize_type(btype)
-        if btype not in VALUE_TYPES:
-            return {"error": f"unknown type {btype!r} — valid types: {', '.join(VALUE_TYPES)}"}
-        if self._current_room_obj() is None:
-            return {"error": "no room"}
-        scope = self._place_box(name, {"type": "box", "value": None, "value_type": btype})
-        self._last_box = name
-        return {"op": "box.create", "name": name, "value_type": btype, "scope": scope}
-
-    def _cmd_chain(self, name: str) -> Dict:
-        palace = self.current["palace"]
-        room = self.current["room"]
-        if palace is None:
-            return {"error": "no palace"}
-        if room is None:
-            return {"error": "chain must be in a room"}
-        r = self._ensure_room(palace, room, self.current["wing"])
-        r["contents"].setdefault(name, _default("chain"))
-        self._last_link_chain = name
-        return {"op": "chain.create", "name": name}
-
-    def _cmd_bag(self, name: str) -> Dict:
-        palace = self.current["palace"]
-        room = self.current["room"]
-        if palace is None:
-            return {"error": "no palace"}
-        if room is None:
-            return {"error": "bag must be in a room"}
-        r = self._ensure_room(palace, room, self.current["wing"])
-        r["contents"].setdefault(name, _default("bag"))
-        return {"op": "bag.create", "name": name}
+        if btype is not None:
+            btype = self._normalize_type(btype)
+            if btype not in VALUE_TYPES:
+                return {"error": f"unknown type {btype!r} — valid types: {', '.join(VALUE_TYPES)}"}
+            bg["value_type"] = btype
+        result: Dict = {"op": "bag.create", "name": name}
+        if btype is not None:
+            result["value_type"] = btype
+        return result
 
     def _cmd_create_device(self, name: str) -> Dict:
         palace = self.current["palace"]
@@ -511,24 +604,17 @@ class IDE:
         r.setdefault("contents", {})[name] = entry
         return "room"
 
-    def _cmd_box_named_typed(self, name: str, btype: str) -> Dict:
+    def _cmd_box_typed(self, btype: str, name: str = None) -> Dict:
         btype = self._normalize_type(btype)
         if btype not in VALUE_TYPES:
             return {"error": f"unknown type {btype!r} — valid types: {', '.join(VALUE_TYPES)}"}
         if self._current_room_obj() is None:
             return {"error": "no room"}
-        scope = self._place_box(name, {"type": "box", "value": None, "value_type": btype})
-        self._last_box = name
-        return {"op": "box.create", "name": name, "value_type": btype, "scope": scope}
-
-    def _cmd_box_anon_typed(self, btype: str) -> Dict:
-        btype = self._normalize_type(btype)
-        if btype not in VALUE_TYPES:
-            return {"error": f"unknown type {btype!r} — valid types: {', '.join(VALUE_TYPES)}"}
-        if self._current_room_obj() is None:
-            return {"error": "no room"}
-        name = f"_box_{self._box_counter}"
-        self._box_counter += 1
+        if name is not None:
+            name = self._strip_stop(name.strip())
+        else:
+            name = f"_box_{self._box_counter}"
+            self._box_counter += 1
         scope = self._place_box(name, {"type": "box", "value": None, "value_type": btype})
         self._last_box = name
         return {"op": "box.create", "name": name, "value_type": btype, "scope": scope}
@@ -611,6 +697,37 @@ class IDE:
         ch["links"][-1]["value"] = v
         return {"op": "set.link.value", "chain": chain, "value": v}
 
+    def _cmd_set_chain_literal(self, name: str, values: str) -> Dict:
+        palace = self.current["palace"]
+        room = self.current["room"]
+        if palace is None:
+            return {"error": "no palace"}
+        if room is None:
+            return {"error": "chain must be in a room"}
+        name = self._strip_stop(name.strip())
+        raw_parts = [v.strip() for v in values.split(" and ")]
+        parsed = [self._parse_value(v) for v in raw_parts]
+        # Infer value_type from the first non-None parsed value
+        value_type = None
+        for v in parsed:
+            if isinstance(v, bool):
+                value_type = "boolean"
+                break
+            if isinstance(v, (int, float)):
+                value_type = "number"
+                break
+            if isinstance(v, str):
+                value_type = "string"
+                break
+        r = self._ensure_room(palace, room, self.current["wing"])
+        ch = r["contents"].setdefault(name, _default("chain"))
+        if value_type is not None:
+            ch["value_type"] = value_type
+        ch["links"] = [{"value": v} for v in parsed]
+        self._last_link_chain = name
+        return {"op": "chain.literal", "name": name,
+                "value_type": value_type, "count": len(parsed)}
+
     def _cmd_set_chain_link(self, chain: str, idx: str, value: str) -> Dict:
         palace = self.current["palace"]
         if palace is None:
@@ -647,6 +764,9 @@ class IDE:
         obj = self._resolve_owner(owner)
         if obj is None:
             return {"error": f"cannot find {owner!r}"}
+        obj_type = obj.get("type")
+        if obj_type and field in _STRUCTURAL_KEYS.get(obj_type, frozenset()):
+            return {"error": f"cannot modify structural field {field!r} of {obj_type}"}
         if field == "value_type":
             v = self._normalize_type(self._strip_stop(value.strip()))
         elif field in ("name", "comment"):
@@ -656,21 +776,17 @@ class IDE:
         obj[field] = v
         return {"op": "set.possessive", "owner": owner, "field": field, "value": v}
 
-    def _cmd_set_input_name(self, value: str) -> Dict:
+    def _cmd_set_input(self, prop: str, value: str) -> Dict:
         d = self._current_device_obj()
         if d is None:
             return {"error": "not in a device"}
         value = self._strip_stop(value.strip())
-        d.setdefault("input", {})["name"] = value
-        return {"op": "set.input.name", "value": value}
-
-    def _cmd_set_input_type(self, value: str) -> Dict:
-        d = self._current_device_obj()
-        if d is None:
-            return {"error": "not in a device"}
-        d.setdefault("input", {})["value_type"] = self._normalize_type(
-            self._strip_stop(value.strip()))
-        return {"op": "set.input.type", "value": value}
+        if prop == "name":
+            d.setdefault("input", {})["name"] = value
+            return {"op": "set.input.name", "value": value}
+        else:  # type
+            d.setdefault("input", {})["value_type"] = self._normalize_type(value)
+            return {"op": "set.input.type", "value": value}
 
     def _cmd_set_comment(self, value: str) -> Dict:
         value = self._strip_stop(value.strip())
@@ -689,11 +805,19 @@ class IDE:
         if d is None:
             return {"error": "not in a device"}
         body = self._strip_stop(body.strip())
-        steps = d.setdefault("process", [])
+        chain = self.current["process_chain"] or "process"
         i = int(idx) - 1
-        while len(steps) <= i:
-            steps.append("")
-        steps[i] = body
+        if chain == "process":
+            steps = d.setdefault("process", [])
+            while len(steps) <= i:
+                steps.append("")
+            steps[i] = body
+        else:
+            r = self._current_room_obj()
+            links = r["contents"][chain].setdefault("links", [])
+            while len(links) <= i:
+                links.append({"value": None})
+            links[i] = {"value": body}
         return {"op": "device.set.step", "step": int(idx), "body": body}
 
     def _cmd_then(self, body: str) -> Dict:
@@ -701,8 +825,12 @@ class IDE:
         if d is None:
             return {"error": "not in a device"}
         body = self._strip_stop(body.strip())
-        steps = d.setdefault("process", [])
-        steps.append(body)
+        chain = self.current["process_chain"] or "process"
+        if chain == "process":
+            d.setdefault("process", []).append(body)
+        else:
+            r = self._current_room_obj()
+            r["contents"][chain].setdefault("links", []).append({"value": body})
         return {"op": "device.append.step", "body": body}
 
     def _cmd_device(self, name: str) -> Dict:
@@ -714,21 +842,53 @@ class IDE:
         if td is not None:
             td["devices"].setdefault(name, _default("device"))
             self.current["device"] = name
-            self.current["in_process"] = False
+            self.current["process_chain"] = None
             return {"op": "device.create", "name": name}
         r = self._current_room_obj()
         r["contents"].setdefault(name, _default("device"))
         self.current["device"] = name
-        self.current["in_process"] = False
+        self.current["process_chain"] = None
         return {"op": "device.create", "name": name}
 
-    def _cmd_enter_process(self) -> Dict:
-        if self._current_device_obj() is None:
-            return {"error": "not in a device"}
-        self.current["in_process"] = True
-        return {"op": "enter.process"}
-
     # --- query handlers ---
+
+    def _cmd_look_around(self) -> Dict:
+        items: List[tuple] = []
+
+        if self.current["device"] is not None:
+            # Inside a device: list its local boxes
+            d = self._current_device_obj()
+            if d:
+                for bname in d.get("boxes", {}):
+                    items.append(("box", bname))
+        elif self.current["type_def"] is not None:
+            # Inside a type definition: list fields and method devices
+            td = self._current_type_def_obj()
+            if td:
+                for fname in td.get("fields", {}):
+                    items.append(("box", fname))
+                for dname in td.get("devices", {}):
+                    items.append(("device", dname))
+        elif self.current["room"] is not None:
+            # Inside a room: list all contents
+            r = self._current_room_obj()
+            if r:
+                for name, item in r.get("contents", {}).items():
+                    items.append((item.get("type", "item"), name))
+        elif self.current["palace"] is not None:
+            # Palace level: list rooms and wings
+            p = self.ast["palaces"].get(self.current["palace"], {})
+            for rname in p.get("rooms", {}):
+                items.append(("room", rname))
+            for wname in p.get("wings", {}):
+                items.append(("wing", wname))
+
+        if not items:
+            desc = "you see nothing"
+        else:
+            parts = [f"a {itype} named {iname}" for itype, iname in items]
+            desc = "you see " + " stop and ".join(parts)
+        return {"op": "look.around", "description": desc}
 
     def _cmd_whereami(self) -> Dict:
         return {
@@ -864,7 +1024,6 @@ class IDE:
         if r is None:
             return {"error": "no room"}
         r["contents"][instance_name] = instance
-        self._last_name = instance_name
         return {"op": "instance.create", "type": type_name, "name": instance_name}
 
     def _cmd_set_instance_field(self, instance: str, field: str, value: str) -> Dict:

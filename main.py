@@ -132,6 +132,10 @@ def main():
                 respond(action["description"])
             continue
 
+        if op == "look.around":
+            respond(action["description"])
+            continue
+
         if op == "set.comment":
             respond("noted")
             continue

@@ -91,6 +91,7 @@ def make_repl():
         if op == "query.link":
             return (str(action["value"]) if action.get("value_of")
                     else action["description"])
+        if op == "look.around":        return action["description"]
         if op == "set.comment":        return "noted"
         return "yes"
 
@@ -746,6 +747,22 @@ class TestUserTypes(unittest.TestCase):
         result = self.repl("area of doofus")
         self.assertAlmostEqual(float(result), 28.26, places=1)
 
+    def test_look_around_in_type(self):
+        self.repl("type circle")
+        self.repl("enter circle")
+        self.repl("box radius")
+        self.repl("enter device area")
+        self.repl("exit")
+        result = self.repl("look around")
+        self.assertIn("a box named radius", result)
+        self.assertIn("a device named area", result)
+
+    def test_look_around_instance_in_room(self):
+        self._setup_circle()
+        self.repl("circle doofus")
+        result = self.repl("look around")
+        self.assertIn("a circle named doofus", result)
+
     def test_two_instances_independent(self):
         self._setup_circle()
         self.repl("circle doofus")
@@ -756,6 +773,139 @@ class TestUserTypes(unittest.TestCase):
         r2 = float(self.repl("run bigone' area"))
         self.assertAlmostEqual(r1, 28.26, places=1)
         self.assertAlmostEqual(r2, 314.0, places=0)
+
+
+# ---------------------------------------------------------------------------
+# 9. Chain literals
+# ---------------------------------------------------------------------------
+
+class TestChainLiterals(unittest.TestCase):
+    """'set chain NAME to V1 and V2 and V3' creates a chain with inline values."""
+
+    def setUp(self):
+        self.ide, self.interp, self.repl = make_repl()
+        self.repl("palace test")
+        self.repl("enter lobby")
+
+    def _lobby(self):
+        return self.ide.ast["palaces"]["test"]["rooms"]["lobby"]
+
+    def _chain(self, name):
+        return self._lobby()["contents"][name]
+
+    def test_string_chain(self):
+        self.assertEqual(
+            self.repl("set chain alphabet stop to a and b and c over"), "yes")
+        ch = self._chain("alphabet")
+        self.assertEqual(ch["type"], "chain")
+        self.assertEqual(ch["value_type"], "string")
+        self.assertEqual([lk["value"] for lk in ch["links"]], ["a", "b", "c"])
+
+    def test_number_chain(self):
+        self.assertEqual(self.repl("set chain scores to 1 and 2 and 3"), "yes")
+        ch = self._chain("scores")
+        self.assertEqual(ch["value_type"], "number")
+        self.assertEqual([lk["value"] for lk in ch["links"]], [1, 2, 3])
+
+    def test_boolean_chain(self):
+        self.assertEqual(self.repl("set chain flags to true and false and true"), "yes")
+        ch = self._chain("flags")
+        self.assertEqual(ch["value_type"], "boolean")
+        self.assertEqual([lk["value"] for lk in ch["links"]], [True, False, True])
+
+    def test_single_value(self):
+        self.assertEqual(self.repl("set chain solo to hello"), "yes")
+        ch = self._chain("solo")
+        self.assertEqual(len(ch["links"]), 1)
+        self.assertEqual(ch["links"][0]["value"], "hello")
+
+    def test_multi_word_name_stop(self):
+        self.repl("set chain high scores stop to 10 and 20 and 30")
+        self.assertIn("high scores", self._lobby()["contents"])
+        ch = self._chain("high scores")
+        self.assertEqual([lk["value"] for lk in ch["links"]], [10, 20, 30])
+
+    def test_name_without_stop(self):
+        self.repl("set chain primes to 2 and 3 and 5 and 7")
+        ch = self._chain("primes")
+        self.assertEqual(len(ch["links"]), 4)
+
+    def test_overwrites_existing_links(self):
+        self.repl("chain sequence")
+        self.repl("append 99 to sequence")
+        self.repl("set chain sequence to 1 and 2")
+        ch = self._chain("sequence")
+        self.assertEqual([lk["value"] for lk in ch["links"]], [1, 2])
+
+    def test_chain_is_queryable_after_literal(self):
+        self.repl("set chain abc to 10 and 20 and 30")
+        self.assertEqual(self.repl("length of abc?"), "3")
+
+    def test_stop_on_last_value(self):
+        # 'stop' at end of last value is stripped by _parse_value
+        self.repl("set chain letters to x and y and z stop")
+        ch = self._chain("letters")
+        self.assertEqual([lk["value"] for lk in ch["links"]], ["x", "y", "z"])
+
+
+# ---------------------------------------------------------------------------
+# 10. Look around
+# ---------------------------------------------------------------------------
+
+class TestLookAround(unittest.TestCase):
+    """'look around' describes items in the current context."""
+
+    def setUp(self):
+        self.ide, self.interp, self.repl = make_repl()
+        self.repl("palace test")
+        self.repl("enter lobby")
+
+    def test_empty_room(self):
+        self.assertEqual(self.repl("look around"), "you see nothing")
+
+    def test_room_with_device_and_box(self):
+        self.repl("device adder")
+        self.repl("box score")
+        result = self.repl("look around")
+        self.assertIn("a device named adder", result)
+        self.assertIn("a box named score", result)
+
+    def test_room_multi_word_name_uses_stop(self):
+        # "immersion blender" as device name — requires multi-word creation
+        self.repl("chain sequence")
+        self.repl("box fruit")
+        result = self.repl("look around")
+        # multiple items are separated by " stop and "
+        self.assertIn(" stop and ", result)
+
+    def test_room_single_item_no_stop(self):
+        self.repl("box fruit")
+        result = self.repl("look around")
+        self.assertTrue(result.startswith("you see a box named fruit"))
+        self.assertNotIn(" stop and ", result)
+
+    def test_device_context_shows_boxes(self):
+        self.repl("device calc")
+        self.repl("enter calc")
+        self.repl("box temp")
+        result = self.repl("look around")
+        self.assertIn("a box named temp", result)
+        # the device itself should not appear (we're inside it)
+        self.assertNotIn("a device named calc", result)
+
+    def test_device_context_empty(self):
+        self.repl("device calc")
+        self.repl("enter calc")
+        self.assertEqual(self.repl("look around"), "you see nothing")
+
+    def test_various_types_in_room(self):
+        self.repl("chain log")
+        self.repl("bag store")
+        self.repl("box counter")
+        result = self.repl("look around")
+        self.assertIn("a chain named log", result)
+        self.assertIn("a bag named store", result)
+        self.assertIn("a box named counter", result)
 
 
 # ---------------------------------------------------------------------------
