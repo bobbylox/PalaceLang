@@ -47,24 +47,47 @@ _BUILTIN_TYPES = frozenset({
     "palace", "wing", "room", "device", "chain", "box", "bag", "type_def", "link"
 })
 
+# Plural / alias → canonical kind name used internally.
+_KIND_NORMALIZE: Dict[str, str] = {
+    "palaces": "palace",
+    "wings":   "wing",
+    "rooms":   "room",
+    "type":    "type_def",
+    "types":   "type_def",
+    "devices": "device",
+    "chains":  "chain",
+    "boxes":   "box",
+    "bags":    "bag",
+}
+
+# Builtin types that live in room.contents and are generically enterable.
+# Derived from _DEFAULTS, excluding structural navigation types and link.
+_ROOM_CONTENT_TYPES: frozenset = frozenset(
+    k for k in _DEFAULTS
+    if k not in {"palace", "wing", "room", "type_def", "link"}
+)
+
 # Maps action op prefixes to the kind of object whose name should be recorded
 # in _last_by_type.  Checked in order; first prefix match wins.
 _OP_TO_KIND: List[Tuple[str, str]] = [
-    ("palace",      "palace"),
-    ("enter.palace","palace"),
-    ("enter.wing",  "wing"),
-    ("wing",        "wing"),
-    ("enter.room",  "room"),
-    ("room",        "room"),
-    ("enter.device","device"),
-    ("device",      "device"),
-    ("chain",       "chain"),
-    ("bag",         "bag"),
-    ("box",         "box"),
-    ("enter.type",  "type"),
-    ("type",        "type"),
+    ("palace",         "palace"),
+    ("enter.palace",   "palace"),
+    ("wing",           "wing"),
+    ("enter.wing",     "wing"),
+    ("room",           "room"),
+    ("enter.room",     "room"),
+    ("device",         "device"),
+    ("enter.device",   "device"),
+    ("chain",          "chain"),
+    ("enter.chain",    "chain"),
+    ("bag",            "bag"),
+    ("enter.bag",      "bag"),
+    ("box",            "box"),
+    ("enter.box",      "box"),
+    ("type",           "type"),
+    ("enter.type",     "type"),
+    ("instance",       "instance"),
     ("enter.instance", "instance"),
-    ("instance",    "instance"),
 ]
 
 # ---------------------------------------------------------------------------
@@ -218,15 +241,13 @@ _BOX_N_TYPED  = _R("Command", "OptNew", "box",   "OptCalled", "Sname", "of", "Sn
 _BOX_OF_NAMED = _R("Command", "OptNew", "box",   "of", "Sname", "OptCalled", "Mname")   # box of TYPE NAME
 _BOX_OF_ANON  = _R("Command", "OptNew", "box",   "of", "Sname")                         # box of TYPE
 _BOX          = _R("Command", "OptNew", "box",   "OptCalled", "Mname")
-_DEVICE       = _R("Command", "OptNew", "device","OptCalled", "Sname")
-_TYPE         = _R("Command", "OptNew", "type",  "OptCalled", "Sname")
+_DEVICE       = _R("Command", "OptNew", "device",  "OptCalled", "Sname")
+_TYPE_FROM    = _R("Command", "OptNew", "type",    "OptCalled", "Mname", "from", "Sname")
+_TYPE         = _R("Command", "OptNew", "type",    "OptCalled", "Mname")
 
-_APPEND_LINK  = _R("Command", "append", "link", "to", "Sname")
-_APPEND_VAL   = _R("Command", "append", "Value", "to", "Sname")
+_APPEND_LINK  = _R("Command", "append", "link", "to", "Mname")
+_APPEND_VAL   = _R("Command", "append", "Value", "to", "Mname")
 
-_SET_BOX_TYPED = _R("Command", "set", "box", "of", "Sname", "to", "Value")
-_SET_BOX_NAMED = _R("Command", "set", "box", "Mname", "to", "Value")
-_SET_CLINK     = _R("Command", "set", "Sname", "OptApos", "link", "NUM", "to", "Value")
 _SET_LVAL      = _R("Command", "set", "link", "value", "to", "Value")
 _SET_LVAL2     = _R("Command", "set", "link", "value", "Value")
 _SET_INPUT_N   = _R("Command", "set", "input", "name", "to", "Value")
@@ -234,9 +255,11 @@ _SET_INPUT_T   = _R("Command", "set", "input", "type", "to", "Value")
 _SET_COMMENT   = _R("Command", "set", "comment", "to", "Value")
 _SET_STEP      = _R("Command", "set", "step",    "NUM", "to", "Value")
 _SET_PATTERN   = _R("Command", "set", "pattern", "to", "Value")
-_SET_CHAIN_LIT = _R("Command", "set", "chain",   "Mname", "to", "Value")
-_SET_BOX_VAL   = _R("Command", "set", "Sname", "to", "Value")
-_SET_POSS      = _R("Command", "set", "Sname", "OptApos", "Value", "to", "Value")
+_SET           = _R("Command", "set", "Value",   "to", "Value")
+
+_RENAME_TO     = _R("Command", "rename", "Value", "to",   "Value")
+_RENAME_S      = _R("Command", "rename", "Value", "stop", "Value")
+_RENAME        = _R("Command", "rename", "Value", "Value")
 
 _THEN          = _R("Command", "then", "Value")
 _STEP_SH       = _R("Command", "step", "NUM", "Value")
@@ -687,37 +710,20 @@ class IDE:
         if ri == _DEVICE:
             return self._cmd_create_device(name=_sname(0))
 
+        if ri == _TYPE_FROM:
+            # OptNew "type" OptCalled Mname "from" Sname
+            return self._cmd_type_from(name=_mname(0), parent=_sname(0))
+
         if ri == _TYPE:
-            return self._cmd_type(name=_sname(0))
+            return self._cmd_type(name=_mname(0))
 
         if ri == _APPEND_LINK:
-            # "append" "link" "to" Sname
-            return self._cmd_append_link(chain=_sname(0))
+            # "append" "link" "to" Mname
+            return self._cmd_append_link(chain=_mname(0))
 
         if ri == _APPEND_VAL:
-            # "append" Value "to" Sname
-            return self._cmd_append_to_chain(value=_value(0), chain=_sname(0))
-
-        if ri == _SET_BOX_TYPED:
-            # "set" "box" "of" Sname "to" Value
-            return self._cmd_set_box_typed(btype=_sname(0), value=_value(0))
-
-        if ri == _SET_BOX_NAMED:
-            # "set" "box" Mname "to" Value
-            return self._cmd_set_box_value_named(name=_mname(0), value=_value(0))
-
-        if ri == _SET_CLINK:
-            # "set" Sname OptApos "link" NUM "to" Value
-            num_val = None
-            for sym, s, e, sub in spans:
-                if sym == "NUM":
-                    num_val = tokens[s].val
-                    break
-            return self._cmd_set_chain_link(
-                chain=_sname(0),
-                idx=str(int(num_val)) if num_val is not None else "1",
-                value=_value(0)
-            )
+            # "append" Value "to" Mname
+            return self._cmd_append_to_chain(value=_value(0), chain=_mname(0))
 
         if ri == _SET_LVAL:
             # "set" "link" "value" "to" Value
@@ -751,17 +757,12 @@ class IDE:
         if ri == _SET_PATTERN:
             return self._cmd_set_pattern(value=_value(0))
 
-        if ri == _SET_CHAIN_LIT:
-            # "set" "chain" Mname "to" Value
-            return self._cmd_set_chain_literal(name=_mname(0), values=_value(0))
+        if ri == _SET:
+            # "set" Value "to" Value  — generalized set
+            return self._cmd_set(lhs=_value(0), rhs=_value(1))
 
-        if ri == _SET_BOX_VAL:
-            # "set" Sname "to" Value
-            return self._cmd_set_box_value(name=_sname(0), value=_value(0))
-
-        if ri == _SET_POSS:
-            # "set" Sname APOS Value "to" Value
-            return self._cmd_set_possessive(owner=_sname(0), prop=_value(0), value=_value(1))
+        if ri in (_RENAME_TO, _RENAME_S, _RENAME):
+            return self._cmd_rename(old=_value(0), new=_value(1))
 
         if ri == _THEN:
             return self._cmd_then(body=_value(0))
@@ -857,6 +858,8 @@ class IDE:
     # ------------------------------------------------------------------
 
     def _cmd_palace(self, name: str) -> Dict:
+        if name in _BUILTIN_TYPES or name in VALUE_TYPES:
+            return {"error": f"{name!r} is a built-in type name"}
         self._ensure_palace(name)
         self._ensure_room(name, "lobby")   # every palace starts with lobby
         self.current = {
@@ -934,17 +937,19 @@ class IDE:
             self.current.update({"device": name, "process_chain": None})
             return {"op": "enter.device", "name": name}
 
-        # implicitly create a new room (in current wing if any)
-        self._ensure_room(palace, name, wing)
-        self.current.update({"room": name, "device": None,
-                             "process_chain": None})
-        return {"op": "enter.room.create", "name": name}
+        return {"error": f"cannot find {name!r}"}
 
     def _cmd_enter_typed(self, kind: str, name: str) -> Dict:
-        kind = kind.lower()
+        kind = _KIND_NORMALIZE.get(kind.lower().strip(), kind.lower().strip())
         name = name.strip()
 
+        if kind in VALUE_TYPES:
+            return {"error": f"{kind!r} is a value type and cannot be entered"}
+
+        # ── Structural navigation (unique context-reset semantics) ─────────
         if kind == "palace":
+            if name in _BUILTIN_TYPES or name in VALUE_TYPES:
+                return {"error": f"{name!r} is a built-in type name"}
             self._ensure_palace(name)
             self._ensure_room(name, "lobby")
             self.current = {
@@ -958,34 +963,56 @@ class IDE:
             return {"error": "no palace"}
 
         if kind == "wing":
+            if name in self._all_type_names(palace):
+                return {"error": f"{name!r} is a type name"}
             self._ensure_wing(palace, name)
             self.current.update({"wing": name, "room": None, "type_def": None,
                                  "instance": None, "device": None, "process_chain": None})
             return {"op": "enter.wing", "name": name}
 
         if kind == "room":
-            wing = self.current["wing"]
-            self._ensure_room(palace, name, wing)
+            if name in self._all_type_names(palace):
+                return {"error": f"{name!r} is a type name"}
+            self._ensure_room(palace, name, self.current["wing"])
             self.current.update({"room": name, "type_def": None,
                                  "instance": None, "device": None, "process_chain": None})
             return {"op": "enter.room", "name": name}
 
-        if kind == "device":
-            return self._cmd_device(name)
-
-        if kind == "type":
+        # ── Type definition ────────────────────────────────────────────────
+        if kind == "type_def":
             palace_obj = self.ast["palaces"][palace]
             palace_obj.setdefault("types", {}).setdefault(name, _default("type_def"))
             self.current.update({"type_def": name, "instance": None,
                                  "device": None, "process_chain": None})
             return {"op": "enter.type_def", "name": name}
 
-        # user-defined type instance
+        # ── Device (special: can live in room or type_def) ─────────────────
+        if kind == "device":
+            res = self._cmd_device(name)
+            if "error" not in res:
+                res["op"] = "enter.device"
+            return res
+
+        # ── Generic room-content builtins (chain, bag, box, …) ────────────
+        if kind in _ROOM_CONTENT_TYPES:
+            r = self._current_room_obj()
+            if r is None:
+                return {"error": "no room"}
+            err = self._check_room_item_name(r, name, kind)
+            if err:
+                return err
+            r["contents"].setdefault(name, _default(kind))
+            return {"op": f"enter.{kind}", "name": name}
+
+        # ── User-defined type instance ─────────────────────────────────────
         palace_obj = self.ast["palaces"][palace]
         if kind in palace_obj.get("types", {}):
             r = self._current_room_obj()
             if r is None:
                 return {"error": "no room"}
+            err = self._check_room_item_name(r, name, kind)
+            if err:
+                return err
             type_def = palace_obj["types"][kind]
             r["contents"].setdefault(name, {
                 "type": kind,
@@ -1064,10 +1091,92 @@ class IDE:
             return {"op": "exit.palace"}
         return {"op": "exit"}
 
+    def _cmd_rename(self, old: str, new: str) -> Dict:
+        old = self._strip_stop(old.strip())
+        new = self._strip_stop(new.strip())
+        if old == new:
+            return {"op": "rename", "old": old, "new": new}
+
+        palace = self.current["palace"]
+        if palace is None:
+            return {"error": "no palace"}
+        palace_obj = self.ast["palaces"][palace]
+
+        # ── 1. Room contents (box, chain, bag, device, instance) ──────────
+        r = self._current_room_obj()
+        if r is not None:
+            contents = r.get("contents", {})
+            if old in contents:
+                if new in contents:
+                    return {"error": f"name {new!r} is already in use in this room"}
+                if new in self._all_type_names(palace):
+                    return {"error": f"{new!r} is a type name"}
+                contents[new] = contents.pop(old)
+                if self.current.get("device") == old:
+                    self.current["device"] = new
+                if self.current.get("instance") == old:
+                    self.current["instance"] = new
+                return {"op": "rename", "old": old, "new": new}
+
+        # ── 2. Type_def devices and fields (when inside a type) ───────────
+        td = self._current_type_def_obj()
+        if td is not None:
+            for bucket in ("devices", "fields"):
+                if old in td.get(bucket, {}):
+                    if new in td[bucket]:
+                        return {"error": f"name {new!r} is already in use in this type"}
+                    td[bucket][new] = td[bucket].pop(old)
+                    if bucket == "devices" and self.current.get("device") == old:
+                        self.current["device"] = new
+                    return {"op": "rename", "old": old, "new": new}
+
+        # ── 3. Rooms ───────────────────────────────────────────────────────
+        wing = self.current["wing"]
+        rooms = (palace_obj.get("wings", {}).get(wing, {}).get("rooms", {})
+                 if wing else palace_obj.get("rooms", {}))
+        if old in rooms:
+            if new in self._all_type_names(palace):
+                return {"error": f"{new!r} is a type name"}
+            if new in rooms:
+                return {"error": f"room {new!r} already exists"}
+            rooms[new] = rooms.pop(old)
+            if self.current.get("room") == old:
+                self.current["room"] = new
+            return {"op": "rename", "old": old, "new": new}
+
+        # ── 4. Wings ───────────────────────────────────────────────────────
+        wings = palace_obj.get("wings", {})
+        if old in wings:
+            if new in self._all_type_names(palace):
+                return {"error": f"{new!r} is a type name"}
+            if new in wings:
+                return {"error": f"wing {new!r} already exists"}
+            wings[new] = wings.pop(old)
+            if self.current.get("wing") == old:
+                self.current["wing"] = new
+            return {"op": "rename", "old": old, "new": new}
+
+        # ── 5. Types ───────────────────────────────────────────────────────
+        types = palace_obj.get("types", {})
+        if old in types:
+            err = self._check_type_create_name(new)
+            if err:
+                return err
+            if new in types:
+                return {"error": f"type {new!r} already exists"}
+            types[new] = types.pop(old)
+            if self.current.get("type_def") == old:
+                self.current["type_def"] = new
+            return {"op": "rename", "old": old, "new": new}
+
+        return {"error": f"cannot find {old!r}"}
+
     def _cmd_wing(self, name: str) -> Dict:
         palace = self.current["palace"]
         if palace is None:
             return {"error": "no palace"}
+        if name in self._all_type_names(palace):
+            return {"error": f"{name!r} is a type name"}
         self._ensure_wing(palace, name)
         return {"op": "wing.create", "name": name}
 
@@ -1075,6 +1184,8 @@ class IDE:
         palace = self.current["palace"]
         if palace is None:
             return {"error": "no palace"}
+        if name in self._all_type_names(palace):
+            return {"error": f"{name!r} is a type name"}
         self._ensure_room(palace, name, self.current["wing"])
         return {"op": "room.create", "name": name}
 
@@ -1151,12 +1262,16 @@ class IDE:
         if room is None:
             return {"error": "chain must be in a room"}
         name = self._strip_stop(name.strip())
-        r = self._ensure_room(palace, room, self.current["wing"])
-        ch = r["contents"].setdefault(name, _default("chain"))
         if btype is not None:
             btype = self._normalize_type(btype)
             if btype not in VALUE_TYPES and btype != "command":
                 return {"error": f"unknown type {btype!r}"}
+        r = self._ensure_room(palace, room, self.current["wing"])
+        err = self._check_room_item_name(r, name, "chain")
+        if err:
+            return err
+        ch = r["contents"].setdefault(name, _default("chain"))
+        if btype is not None:
             ch["value_type"] = btype
         self._last_link_chain = name
         result: Dict = {"op": "chain.create", "name": name}
@@ -1172,12 +1287,16 @@ class IDE:
         if room is None:
             return {"error": "bag must be in a room"}
         name = self._strip_stop(name.strip())
-        r = self._ensure_room(palace, room, self.current["wing"])
-        bg = r["contents"].setdefault(name, _default("bag"))
         if btype is not None:
             btype = self._normalize_type(btype)
             if btype not in VALUE_TYPES:
                 return {"error": f"unknown type {btype!r} — valid types: {', '.join(VALUE_TYPES)}"}
+        r = self._ensure_room(palace, room, self.current["wing"])
+        err = self._check_room_item_name(r, name, "bag")
+        if err:
+            return err
+        bg = r["contents"].setdefault(name, _default("bag"))
+        if btype is not None:
             bg["value_type"] = btype
         result: Dict = {"op": "bag.create", "name": name}
         if btype is not None:
@@ -1193,6 +1312,9 @@ class IDE:
             td["devices"].setdefault(name, _default("device"))
             return {"op": "device.create", "name": name}
         r = self._current_room_obj()
+        err = self._check_room_item_name(r, name, "device")
+        if err:
+            return err
         r["contents"].setdefault(name, _default("device"))
         return {"op": "device.create", "name": name}
 
@@ -1214,6 +1336,50 @@ class IDE:
             return f"cannot set box of type {btype} to {vtype} value"
         return None
 
+    def _all_type_names(self, palace: str) -> frozenset:
+        """All reserved type names: built-ins + value types + user-defined types."""
+        user = set(self.ast["palaces"].get(palace, {}).get("types", {}).keys())
+        return _BUILTIN_TYPES | frozenset(VALUE_TYPES) | user
+
+    def _check_room_item_name(self, room_obj: Dict, name: str,
+                               new_type: str) -> Optional[Dict]:
+        """Return error dict if name is unusable for a new item of new_type in room_obj.
+
+        Checks:
+          1. name is not a reserved type name
+          2. name is not already occupied by a different type in this room
+        Returns None if the name is clear (or already occupied by same type, idempotent).
+        """
+        palace = self.current["palace"]
+        if palace and name in self._all_type_names(palace):
+            return {"error": f"{name!r} is a type name and cannot be used as an item name"}
+        existing = room_obj.get("contents", {}).get(name)
+        if existing is not None and existing.get("type") != new_type:
+            return {"error": f"name {name!r} is already used as a "
+                             f"{existing.get('type')} in this room"}
+        return None
+
+    def _check_type_create_name(self, name: str) -> Optional[Dict]:
+        """Return error dict if name is unusable for a new type definition.
+
+        Checks:
+          1. name is not a built-in type or value type
+          2. name is not used as an item in any room of the current palace
+        """
+        palace = self.current["palace"]
+        if name in _BUILTIN_TYPES or name in VALUE_TYPES:
+            return {"error": f"{name!r} is a built-in type name"}
+        if palace:
+            palace_obj = self.ast["palaces"].get(palace, {})
+            for room_obj in palace_obj.get("rooms", {}).values():
+                if name in room_obj.get("contents", {}):
+                    return {"error": f"{name!r} is already used as a room item"}
+            for wing_obj in palace_obj.get("wings", {}).values():
+                for room_obj in wing_obj.get("rooms", {}).values():
+                    if name in room_obj.get("contents", {}):
+                        return {"error": f"{name!r} is already used as a room item"}
+        return None
+
     def _place_box(self, name: str, entry: Dict) -> str:
         """Insert box entry at current scope; return 'device' or 'room'."""
         d = self._current_device_obj()
@@ -1226,18 +1392,306 @@ class IDE:
 
     def _cmd_box_typed(self, btype: str, name: str = None) -> Dict:
         btype = self._normalize_type(btype)
-        if btype not in VALUE_TYPES:
-            return {"error": f"unknown type {btype!r} — valid types: {', '.join(VALUE_TYPES)}"}
         if self._current_room_obj() is None:
             return {"error": "no room"}
         if name is not None:
             name = self._strip_stop(name.strip())
+            r = self._current_room_obj()
+            if r is not None and self._current_device_obj() is None:
+                err = self._check_room_item_name(r, name, "box")
+                if err:
+                    return err
         else:
             name = f"_box_{self._box_counter}"
             self._box_counter += 1
         scope = self._place_box(name, {"type": "box", "value": None, "value_type": btype})
         self._last_box = name
         return {"op": "box.create", "name": name, "value_type": btype, "scope": scope}
+
+    def _cmd_set(self, lhs: str, rhs: str) -> Dict:
+        """Generalized 'set LHS to RHS' — supports arbitrary possessive-path depth.
+
+        LHS is resolved as a possessive path against the current AST context.
+        Explicit structural prefixes bypass path resolution for clarity:
+          - "box of TYPE [NAME]"  → typed box create-and-set
+          - "box NAME [stop]"     → box create-if-needed and set value
+          - "chain NAME [stop]"   → chain literal set
+        Everything else is resolved via _path_find_targets, which handles
+        chains of possessives of any length and auto-disambiguates by checking
+        which paths actually exist in the AST.
+        """
+        lhs = lhs.strip()
+        rhs = rhs.strip()
+        words = lhs.split()
+
+        # "box of TYPE [NAME [stop]]"
+        if len(words) >= 3 and words[0] == "box" and words[1] == "of":
+            btype = words[2]
+            rest = words[3:]
+            name = self._strip_stop(" ".join(rest)) if rest else None
+            if not name:
+                return self._cmd_set_box_typed(btype, rhs)
+            return self._cmd_set_box_typed_named(btype, name, rhs)
+
+        # "box NAME [stop]"
+        if words and words[0] == "box":
+            return self._cmd_set_box_value_named(self._strip_stop(" ".join(words[1:])), rhs)
+
+        # "chain NAME [stop]"
+        if words and words[0] == "chain":
+            return self._cmd_set_chain_literal(self._strip_stop(" ".join(words[1:])), rhs)
+
+        # General recursive path resolution
+        targets = self._path_find_targets(lhs)
+        if not targets:
+            return self._path_error(lhs)
+        if len(targets) > 1:
+            # Multiple valid parses — report ambiguity rather than silently picking one
+            paths = "; ".join(f"({id(c)}, {k!r})" for c, k in targets)
+            return {"error": f"ambiguous path {lhs!r} — {len(targets)} interpretations exist",
+                    "ambiguous": True}
+        return self._path_apply(targets[0], rhs)
+
+    # ------------------------------------------------------------------
+    # Possessive-path resolution helpers
+    # ------------------------------------------------------------------
+
+    def _path_find_targets(self, expr: str) -> List[Tuple[Dict, str]]:
+        """Find all valid (container, key) targets for a possessive-path expression.
+
+        Splits expr on ' 's ' and walks the AST recursively, trying all
+        possible multi-word-name splits within each segment.  Returns every
+        valid terminal (container, key) pair found across all starting contexts.
+        """
+        expr = self._strip_stop(expr.strip())
+        segs = expr.split(" 's ")
+
+        seen: set = set()
+        results: List[Tuple[Dict, str]] = []
+
+        def add(c: Dict, k: str) -> None:
+            ident = (id(c), k)
+            if ident not in seen:
+                seen.add(ident)
+                results.append((c, k))
+
+        for start in self._path_starting_contexts():
+            for c, k in self._path_resolve_from(start, segs):
+                add(c, k)
+
+        return results
+
+    def _path_starting_contexts(self) -> List[Dict]:
+        """Return AST objects to use as path-resolution roots (most-specific first)."""
+        starts: List[Dict] = []
+        d = self._current_device_obj()
+        if d is not None:
+            starts.append(d)
+        r = self._current_room_obj()
+        if r is not None:
+            starts.append(r)
+        td = self._current_type_def_obj()
+        if td is not None and td not in starts:
+            starts.append(td)
+        p = self.current.get("palace")
+        if p is not None:
+            pobj = self.ast["palaces"].get(p)
+            if pobj is not None:
+                starts.append(pobj)
+        return starts
+
+    def _path_resolve_from(self, obj: Dict,
+                           segs: List[str]) -> List[Tuple[Dict, str]]:
+        """Recursively resolve path segments starting from obj.
+
+        Each element of segs is a string of words (the text between successive
+        ' 's ' markers in the original expression).  Within a segment the words
+        can be split at any word boundary: the longest prefix that navigates to
+        a real AST node wins (longest-first to prefer specific multi-word names),
+        with shorter prefixes tried as fallback to allow ambiguity detection.
+        """
+        if not segs:
+            return []
+
+        seg_words = segs[0].strip().split()
+        remaining_segs = segs[1:]
+        results: List[Tuple[Dict, str]] = []
+
+        # Try all prefix lengths within this segment (longest first)
+        for name_len in range(len(seg_words), 0, -1):
+            name = " ".join(seg_words[:name_len])
+            suffix = seg_words[name_len:]
+
+            # Suffix words fold back into the next segment
+            if suffix:
+                if remaining_segs:
+                    new_rem = [" ".join(suffix) + " " + remaining_segs[0]] + remaining_segs[1:]
+                else:
+                    new_rem = [" ".join(suffix)]
+            else:
+                new_rem = remaining_segs
+
+            if not new_rem:
+                # Terminal: resolve (container, key) for setting 'name' on obj
+                c, k = self._path_terminal(obj, name)
+                if c is not None:
+                    results.append((c, k))
+            else:
+                # Navigation: go into obj[name], then continue
+                child = self._path_nav(obj, name)
+                if child is not None:
+                    results.extend(self._path_resolve_from(child, new_rem))
+
+        # "link N [...]" — navigate into chain link at 1-based index
+        if len(seg_words) >= 2 and seg_words[0] == "link":
+            try:
+                idx = int(seg_words[1])
+                link = self._path_get_link(obj, idx)
+                if link is not None:
+                    suffix = seg_words[2:]
+                    if suffix:
+                        new_rem = ([" ".join(suffix) + " " + remaining_segs[0]]
+                                   + remaining_segs[1:] if remaining_segs
+                                   else [" ".join(suffix)])
+                    else:
+                        new_rem = remaining_segs
+                    if not new_rem:
+                        results.append((link, "value"))
+                    else:
+                        results.extend(self._path_resolve_from(link, new_rem))
+            except (ValueError, IndexError):
+                pass
+
+        return results
+
+    def _path_nav(self, obj: Dict, name: str) -> Optional[Dict]:
+        """Navigate from obj to a named immediate child."""
+        if obj is None:
+            return None
+        ot = obj.get("type")
+        if ot == "room":
+            return obj.get("contents", {}).get(name)
+        elif ot == "device":
+            if name == "input":
+                return obj.get("input")
+            return obj.get("boxes", {}).get(name)
+        elif ot == "palace":
+            child = obj.get("rooms", {}).get(name)
+            if child is not None:
+                return child
+            child = obj.get("wings", {}).get(name)
+            if child is not None:
+                return child
+            return obj.get("types", {}).get(name)
+        elif ot == "wing":
+            return obj.get("rooms", {}).get(name)
+        elif ot == "type_def":
+            child = obj.get("devices", {}).get(name)
+            if child is not None:
+                return child
+            return obj.get("fields", {}).get(name)
+        elif ot is not None and ot not in _BUILTIN_TYPES:
+            # User-type instance: navigate into a field
+            return obj.get("fields", {}).get(name)
+        return None
+
+    def _path_terminal(self, obj: Dict, name: str) -> Tuple[Optional[Dict], Optional[str]]:
+        """Return (container, key) for setting 'name' as the terminal of a path.
+
+        Returns (None, None) if the target doesn't exist or isn't settable.
+        """
+        if obj is None:
+            return None, None
+        ot = obj.get("type")
+
+        # Known property map
+        mapped = _PROP_MAP.get(name)
+        if mapped is not None:
+            return obj, mapped
+
+        # "parent" is settable on any type_def
+        if name == "parent" and ot == "type_def":
+            return obj, "parent"
+
+        if ot == "room":
+            child = obj.get("contents", {}).get(name)
+            if child is not None and child.get("type") == "box":
+                return child, "value"
+
+        elif ot == "device":
+            boxes = obj.get("boxes", {})
+            if name in boxes:
+                return boxes[name], "value"
+
+        elif ot == "box":
+            if name in ("value", "value_type"):
+                return obj, name
+
+        elif ot == "type_def":
+            if name in obj:
+                return obj, name
+
+        elif ot is not None and ot not in _BUILTIN_TYPES:
+            # User-type instance: set a field's value
+            fields = obj.get("fields", {})
+            if name in fields:
+                return fields[name], "value"
+
+        return None, None
+
+    def _path_get_link(self, obj: Dict, idx: int) -> Optional[Dict]:
+        """Return the link at 1-based index, auto-extending the chain if needed."""
+        if obj is None or obj.get("type") != "chain":
+            return None
+        links = obj.setdefault("links", [])
+        i = idx - 1
+        while len(links) <= i:
+            links.append({"value": None})
+        return links[i]
+
+    def _path_apply(self, target: Tuple[Dict, str], rhs: str) -> Dict:
+        """Write a parsed RHS value into target (container, key) with type-checking."""
+        container, key = target
+        rhs = rhs.strip()
+
+        if key == "value_type":
+            v: Any = self._normalize_type(self._strip_stop(rhs))
+        elif key in ("name", "comment", "parent"):
+            v = self._strip_stop(rhs)
+        else:
+            v = self._parse_value(rhs)
+
+        container[key] = v
+        return {"op": "set.path", "key": key, "value": v}
+
+    def _path_error(self, lhs: str) -> Dict:
+        """Generate a context-appropriate error for a failed path resolution."""
+        words = lhs.split()
+
+        # Possessive path where owner exists but terminal property is unknown
+        if " 's " in lhs:
+            prop = lhs.split(" 's ")[-1].strip()
+            prop = self._strip_stop(prop)
+            if _PROP_MAP.get(prop) is None and prop != "parent":
+                return {"error": f"unknown property {prop!r}"}
+
+        # "NAME parent" — type doesn't exist
+        if len(words) >= 2 and words[-1] == "parent":
+            owner = " ".join(words[:-1])
+            if owner.endswith(" 's"):
+                owner = owner[:-3]
+            elif owner.endswith("'s"):
+                owner = owner[:-2]
+            owner = self._strip_stop(owner.strip())
+            return {"error": f"no type {owner!r}"}
+
+        # Single-name: check if it exists but isn't settable
+        name = self._strip_stop(lhs)
+        obj = self._resolve_owner(name)
+        if obj is not None:
+            return {"error": f"{name!r} is not a box"}
+
+        return {"error": f"cannot find {name!r}"}
 
     def _cmd_set_box_value(self, name: str, value: str) -> Dict:
         """Sugar: 'set NAME to VALUE' → set NAME's value to VALUE (when NAME is a box)."""
@@ -1249,14 +1703,21 @@ class IDE:
         return self._cmd_set_possessive(name, "value", value)
 
     def _cmd_set_box_value_named(self, name: str, value: str) -> Dict:
-        """Sugar: 'set box NAME (stop) to VALUE' → set NAME's value to VALUE."""
+        """Sugar: 'set box NAME (stop) to VALUE' → create box if needed, then set value."""
         name = self._strip_stop(name.strip())
         obj = self._resolve_owner(name)
         if obj is None:
-            return {"error": f"cannot find {name!r}"}
-        if obj.get("type") != "box":
+            self._cmd_box(name)
+        elif obj.get("type") != "box":
             return {"error": f"{name!r} is not a box"}
         return self._cmd_set_possessive(name, "value", value)
+
+    def _cmd_set_box_typed_named(self, btype: str, name: str, value: str) -> Dict:
+        """'set box of TYPE NAME to VALUE' → create typed box if needed, then set value."""
+        res = self._cmd_box_typed(btype=btype, name=name)
+        if "error" in res:
+            return res
+        return self._cmd_set_possessive(res["name"], "value", value)
 
     def _cmd_set_box_typed(self, btype: str, value: str) -> Dict:
         if btype not in VALUE_TYPES:
@@ -1287,6 +1748,9 @@ class IDE:
         r = self._current_room_obj()
         if r is None:
             return {"error": "no room"}
+        err = self._check_room_item_name(r, name, "box")
+        if err:
+            return err
         r.setdefault("contents", {})[name] = {"type": "box", "value": None}
         return {"op": "box.create", "name": name, "scope": "room"}
 
@@ -1295,6 +1759,9 @@ class IDE:
         if palace is None:
             return {"error": "no palace"}
         r = self._current_room_obj()
+        err = self._check_room_item_name(r, chain, "chain")
+        if err:
+            return err
         ch = r["contents"].setdefault(chain, _default("chain"))
         ch["links"].append({"value": None})
         self._last_link_chain = chain
@@ -1305,6 +1772,9 @@ class IDE:
         if palace is None:
             return {"error": "no palace"}
         r = self._current_room_obj()
+        err = self._check_room_item_name(r, chain, "chain")
+        if err:
+            return err
         ch = r["contents"].setdefault(chain, _default("chain"))
         v = self._parse_value(value)
         # type check — explicit value_type takes precedence over inference
@@ -1359,6 +1829,9 @@ class IDE:
                 value_type = "string"
                 break
         r = self._ensure_room(palace, room, self.current["wing"])
+        err = self._check_room_item_name(r, name, "chain")
+        if err:
+            return err
         ch = r["contents"].setdefault(name, _default("chain"))
         if value_type is not None:
             ch["value_type"] = value_type
@@ -1491,6 +1964,9 @@ class IDE:
             self.current["process_chain"] = None
             return {"op": "device.create", "name": name}
         r = self._current_room_obj()
+        err = self._check_room_item_name(r, name, "device")
+        if err:
+            return err
         r["contents"].setdefault(name, _default("device"))
         self.current["device"] = name
         self.current["process_chain"] = None
@@ -1693,9 +2169,31 @@ class IDE:
         palace = self.current["palace"]
         if palace is None:
             return {"error": "no palace"}
+        err = self._check_type_create_name(name)
+        if err:
+            return err
         palace_obj = self.ast["palaces"][palace]
         palace_obj.setdefault("types", {}).setdefault(name, _default("type_def"))
         return {"op": "type.create", "name": name}
+
+    def _cmd_type_from(self, name: str, parent: str) -> Dict:
+        res = self._cmd_type(name)
+        if "error" in res:
+            return res
+        palace = self.current["palace"]
+        self.ast["palaces"][palace]["types"][name]["parent"] = parent
+        res["parent"] = parent
+        return res
+
+    def _cmd_set_parent(self, name: str, parent: str) -> Dict:
+        palace = self.current["palace"]
+        if palace is None:
+            return {"error": "no palace"}
+        types = self.ast["palaces"][palace].get("types", {})
+        if name not in types:
+            return {"error": f"no type {name!r}"}
+        types[name]["parent"] = parent
+        return {"op": "set.parent", "name": name, "parent": parent}
 
     def _cmd_step_shorthand(self, idx: str, body: str) -> Dict:
         return self._cmd_set_step(idx, body)
@@ -1724,6 +2222,9 @@ class IDE:
         r = self._current_room_obj()
         if r is None:
             return {"error": "no room"}
+        err = self._check_room_item_name(r, instance_name, type_name)
+        if err:
+            return err
         r["contents"][instance_name] = instance
         return {"op": "instance.create", "type": type_name, "name": instance_name}
 

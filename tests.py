@@ -457,6 +457,19 @@ class TestTypedCreation(unittest.TestCase):
         self.repl("chain of number scores")
         self.assertEqual(self.repl("append 10 to scores"), "yes")
 
+    def test_append_to_multi_word_chain_name(self):
+        self.repl("chain sea quest stop")
+        self.assertEqual(self.repl("append 1 to sea quest"), "yes")
+        ch = self._lobby()["contents"]["sea quest"]
+        self.assertEqual(len(ch["links"]), 1)
+        self.assertEqual(ch["links"][0]["value"], 1)
+
+    def test_append_link_to_multi_word_chain_name(self):
+        self.repl("chain sea quest stop")
+        self.assertEqual(self.repl("append link to sea quest"), "yes")
+        ch = self._lobby()["contents"]["sea quest"]
+        self.assertEqual(len(ch["links"]), 1)
+
     def test_chain_untyped_still_works(self):
         self.assertEqual(self.repl("chain plain"), "yes")
         self.assertIsNone(self._lobby()["contents"]["plain"]["value_type"])
@@ -510,12 +523,21 @@ class TestTypedCreation(unittest.TestCase):
         self.assertIn("score", self._lobby()["contents"])
 
     def test_unknown_type_rejected(self):
-        r = self.repl("chain of widgets foo")
-        self.assertIn("unknown type", r)
-        r = self.repl("bag of widgets foo")
-        self.assertIn("unknown type", r)
-        r = self.repl("box of widgets foo")
-        self.assertIn("unknown type", r)
+        # chains and bags only hold scalar value types
+        self.assertIn("unknown type", self.repl("chain of widgets foo"))
+        self.assertIn("unknown type", self.repl("bag of widgets foo"))
+
+    def test_box_accepts_builtin_type(self):
+        self.assertEqual(self.repl("box of chain coord"), "yes")
+        box = self._lobby()["contents"]["coord"]
+        self.assertEqual(box["type"], "box")
+        self.assertEqual(box["value_type"], "chain")
+
+    def test_box_accepts_user_type(self):
+        self.repl("type point")
+        self.assertEqual(self.repl("box of point origin"), "yes")
+        box = self._lobby()["contents"]["origin"]
+        self.assertEqual(box["value_type"], "point")
 
 
 # ---------------------------------------------------------------------------
@@ -699,9 +721,23 @@ class TestSetBoxSugar(unittest.TestCase):
         r = self.repl("set box sequence to 0")
         self.assertIn("not a box", r)
 
-    def test_set_box_name_errors_if_not_found(self):
-        r = self.repl("set box phantom to 1")
-        self.assertIn("cannot find", r)
+    def test_set_box_name_creates_if_not_found(self):
+        self.assertEqual(self.repl("set box phantom to 1"), "yes")
+        box = self._lobby()["contents"]["phantom"]
+        self.assertEqual(box["type"], "box")
+        self.assertEqual(box["value"], 1)
+
+    def test_set_box_typed_named_creates_and_sets(self):
+        self.assertEqual(self.repl("set box of number radius stop to 10"), "yes")
+        box = self._lobby()["contents"]["radius"]
+        self.assertEqual(box["value_type"], "number")
+        self.assertEqual(box["value"], 10)
+
+    def test_set_box_named_stop_creates_and_sets(self):
+        self.assertEqual(self.repl("set box score stop to 42"), "yes")
+        box = self._lobby()["contents"]["score"]
+        self.assertEqual(box["type"], "box")
+        self.assertEqual(box["value"], 42)
 
     # --- set box of TYPE to VALUE still works (not broken by new pattern) ---
 
@@ -848,6 +884,36 @@ class TestUserTypes(unittest.TestCase):
         self.repl("circle doofus")
         result = self.repl("look around")
         self.assertIn("a circle named 'doofus'", result)
+
+    # --- type inheritance ---
+
+    def test_type_from_one_line(self):
+        self.assertEqual(self.repl("type conga line stop from chain"), "yes")
+        self.assertIn("conga line", self.ide.ast["palaces"]["mypalace"]["types"])
+        self.assertEqual(self._type("conga line")["parent"], "chain")
+
+    def test_type_from_one_line_single_word(self):
+        self.assertEqual(self.repl("type sequence from chain"), "yes")
+        self.assertEqual(self._type("sequence")["parent"], "chain")
+
+    def test_type_from_two_line_with_possessive(self):
+        self.repl("type square dance")
+        self.assertEqual(self._type("square dance")["parent"], "bag")  # default
+        self.assertEqual(self.repl("set square dance's parent to conga line"), "yes")
+        self.assertEqual(self._type("square dance")["parent"], "conga line")
+
+    def test_type_from_two_line_without_possessive(self):
+        self.repl("type waltz")
+        self.repl("set waltz parent to chain")
+        self.assertEqual(self._type("waltz")["parent"], "chain")
+
+    def test_set_parent_on_unknown_type_errors(self):
+        result = self.repl("set ghost parent to chain")
+        self.assertIn("no type", result)
+
+    def test_type_multi_word_name_no_inheritance(self):
+        self.assertEqual(self.repl("type square dance"), "yes")
+        self.assertIn("square dance", self.ide.ast["palaces"]["mypalace"]["types"])
 
     def test_two_instances_independent(self):
         self._setup_circle()
@@ -997,6 +1063,270 @@ class TestLookAround(unittest.TestCase):
         self.assertIn("a chain named 'log'", result)
         self.assertIn("a bag named 'store'", result)
         self.assertIn("a box named 'counter'", result)
+
+
+# ---------------------------------------------------------------------------
+# 11. Rename command
+# ---------------------------------------------------------------------------
+
+class TestRename(unittest.TestCase):
+    """'rename OLD to NEW' renames things in the current context."""
+
+    def setUp(self):
+        self.ide, self.interp, self.repl = make_repl()
+        self.repl("palace mypalace")
+        self.repl("enter lobby")
+
+    def _lobby(self):
+        return self.ide.ast["palaces"]["mypalace"]["rooms"]["lobby"]
+
+    def _palace(self):
+        return self.ide.ast["palaces"]["mypalace"]
+
+    # ── Room items ────────────────────────────────────────────────────────
+
+    def test_rename_box(self):
+        self.repl("box score")
+        self.assertEqual(self.repl("rename score to tally"), "yes")
+        self.assertNotIn("score", self._lobby()["contents"])
+        self.assertIn("tally", self._lobby()["contents"])
+
+    def test_rename_chain(self):
+        self.repl("chain log")
+        self.assertEqual(self.repl("rename log to history"), "yes")
+        self.assertNotIn("log", self._lobby()["contents"])
+        self.assertIn("history", self._lobby()["contents"])
+
+    def test_rename_device(self):
+        self.repl("device calc")
+        self.assertEqual(self.repl("rename calc to compute"), "yes")
+        self.assertIn("compute", self._lobby()["contents"])
+
+    def test_rename_preserves_data(self):
+        self.repl("box score")
+        self.repl("set score to 42")
+        self.repl("rename score to tally")
+        self.assertEqual(self._lobby()["contents"]["tally"]["value"], 42)
+
+    def test_rename_with_stop_separator(self):
+        self.repl("box score")
+        self.assertEqual(self.repl("rename score stop tally"), "yes")
+        self.assertIn("tally", self._lobby()["contents"])
+
+    def test_rename_multiword_old_name_with_stop(self):
+        self.repl("box high score stop")
+        self.assertEqual(self.repl("rename high score stop to best score"), "yes")
+        self.assertNotIn("high score", self._lobby()["contents"])
+        self.assertIn("best score", self._lobby()["contents"])
+
+    def test_rename_same_name_is_noop(self):
+        self.repl("box score")
+        self.assertEqual(self.repl("rename score to score"), "yes")
+        self.assertIn("score", self._lobby()["contents"])
+
+    def test_rename_updates_current_device(self):
+        self.repl("device calc")
+        self.repl("enter calc")
+        self.repl("rename calc to compute")
+        self.assertEqual(self.ide.current["device"], "compute")
+
+    # ── Rooms ─────────────────────────────────────────────────────────────
+
+    def test_rename_room(self):
+        self.repl("room vault")
+        self.assertEqual(self.repl("rename vault to storage"), "yes")
+        rooms = self._palace()["rooms"]
+        self.assertNotIn("vault", rooms)
+        self.assertIn("storage", rooms)
+
+    def test_rename_current_room_updates_context(self):
+        self.repl("room vault")
+        self.repl("enter vault")
+        self.repl("rename vault to storage")
+        self.assertEqual(self.ide.current["room"], "storage")
+
+    # ── Wings ─────────────────────────────────────────────────────────────
+
+    def test_rename_wing(self):
+        self.repl("wing east")
+        self.assertEqual(self.repl("rename east to west"), "yes")
+        wings = self._palace()["wings"]
+        self.assertNotIn("east", wings)
+        self.assertIn("west", wings)
+
+    # ── Types ─────────────────────────────────────────────────────────────
+
+    def test_rename_type(self):
+        self.repl("type point")
+        self.assertEqual(self.repl("rename point to vertex"), "yes")
+        types = self._palace()["types"]
+        self.assertNotIn("point", types)
+        self.assertIn("vertex", types)
+
+    def test_rename_type_updates_context(self):
+        self.repl("type point")
+        self.repl("enter point")
+        self.repl("rename point to vertex")
+        self.assertEqual(self.ide.current["type_def"], "vertex")
+
+    # ── Error cases ───────────────────────────────────────────────────────
+
+    def test_rename_not_found(self):
+        result = self.repl("rename ghost to phantom")
+        self.assertIn("cannot find", result)
+
+    def test_rename_new_name_already_in_use(self):
+        self.repl("box score")
+        self.repl("box tally")
+        result = self.repl("rename score to tally")
+        self.assertIn("already in use", result)
+
+    def test_rename_new_name_is_type(self):
+        self.repl("box score")
+        result = self.repl("rename score to chain")
+        self.assertIn("type name", result)
+
+    def test_rename_room_new_name_is_type(self):
+        self.repl("room vault")
+        result = self.repl("rename vault to device")
+        self.assertIn("type name", result)
+
+
+# ---------------------------------------------------------------------------
+# 12. Name conflict / uniqueness rules
+# ---------------------------------------------------------------------------
+
+class TestNameConflicts(unittest.TestCase):
+    """Verifies that reserved and conflicting names are rejected."""
+
+    def setUp(self):
+        self.ide, self.interp, self.repl = make_repl()
+        # every test starts inside a palace lobby
+        self.repl("palace mypalace")
+        self.repl("enter lobby")
+
+    def _lobby(self):
+        return self.ide.ast["palaces"]["mypalace"]["rooms"]["lobby"]
+
+    # ── Palace names ──────────────────────────────────────────────────────
+
+    def test_palace_cannot_be_builtin_type(self):
+        _, _, r2 = make_repl()
+        result = r2("palace box")
+        self.assertIn("built-in type", result)
+
+    def test_palace_cannot_be_value_type(self):
+        _, _, r2 = make_repl()
+        result = r2("palace number")
+        self.assertIn("built-in type", result)
+
+    def test_enter_palace_cannot_be_builtin_type(self):
+        _, _, r2 = make_repl()
+        result = r2("enter palace chain")
+        self.assertIn("built-in type", result)
+
+    def test_enter_palace_cannot_be_value_type(self):
+        _, _, r2 = make_repl()
+        result = r2("enter palace string")
+        self.assertIn("built-in type", result)
+
+    # ── Wing names ────────────────────────────────────────────────────────
+
+    def test_wing_cannot_be_builtin_type(self):
+        result = self.repl("wing device")
+        self.assertIn("type name", result)
+
+    def test_wing_cannot_be_value_type(self):
+        result = self.repl("wing string")
+        self.assertIn("type name", result)
+
+    def test_enter_wing_cannot_be_builtin_type(self):
+        result = self.repl("enter wing bag")
+        self.assertIn("type name", result)
+
+    def test_wing_cannot_match_user_type(self):
+        self.repl("type widget")
+        result = self.repl("wing widget")
+        self.assertIn("type name", result)
+
+    # ── Room names ────────────────────────────────────────────────────────
+
+    def test_room_cannot_be_builtin_type(self):
+        result = self.repl("room box")
+        self.assertIn("type name", result)
+
+    def test_room_cannot_be_value_type(self):
+        result = self.repl("room boolean")
+        self.assertIn("type name", result)
+
+    def test_enter_room_cannot_be_builtin_type(self):
+        result = self.repl("enter room chain")
+        self.assertIn("type name", result)
+
+    def test_room_cannot_match_user_type(self):
+        self.repl("type widget")
+        result = self.repl("room widget")
+        self.assertIn("type name", result)
+
+    # ── Room item names vs. type names ────────────────────────────────────
+
+    def test_box_cannot_use_builtin_type_name(self):
+        result = self.repl("box chain")
+        self.assertIn("type name", result)
+
+    def test_chain_cannot_use_value_type_name(self):
+        result = self.repl("chain number")
+        self.assertIn("type name", result)
+
+    def test_bag_cannot_use_builtin_type_name(self):
+        result = self.repl("bag device")
+        self.assertIn("type name", result)
+
+    def test_device_cannot_use_builtin_type_name(self):
+        result = self.repl("device box")
+        self.assertIn("type name", result)
+
+    def test_room_item_cannot_use_user_type_name(self):
+        self.repl("type point")
+        result = self.repl("box point")
+        self.assertIn("type name", result)
+
+    # ── Room item uniqueness (same room, different types) ─────────────────
+
+    def test_chain_blocked_by_existing_box(self):
+        self.repl("box foo")
+        result = self.repl("chain foo")
+        self.assertIn("already used as", result)
+
+    def test_box_blocked_by_existing_chain(self):
+        self.repl("chain scores")
+        result = self.repl("box scores")
+        self.assertIn("already used as", result)
+
+    def test_device_blocked_by_existing_box(self):
+        self.repl("box calc")
+        result = self.repl("device calc")
+        self.assertIn("already used as", result)
+
+    def test_bag_blocked_by_existing_chain(self):
+        self.repl("chain log")
+        result = self.repl("bag log")
+        self.assertIn("already used as", result)
+
+    # ── Type creation conflicts ───────────────────────────────────────────
+
+    def test_type_cannot_be_builtin_type(self):
+        result = self.repl("type box")
+        self.assertIn("built-in type", result)
+
+    def test_type_cannot_be_value_type(self):
+        result = self.repl("type number")
+        self.assertIn("built-in type", result)
+
+    def test_type_blocked_by_room_item(self):
+        self.repl("box foo")
+        result = self.repl("type foo")
+        self.assertIn("already used as a room item", result)
 
 
 # ---------------------------------------------------------------------------

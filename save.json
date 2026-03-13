@@ -6,6 +6,10 @@
         "lobby": {
           "type": "room",
           "contents": {}
+        },
+        "fields": {
+          "type": "room",
+          "contents": {}
         }
       },
       "wings": {
@@ -23,14 +27,59 @@
                 "sea quest": {
                   "type": "chain",
                   "value_type": "number",
-                  "links": []
+                  "links": [
+                    {
+                      "value": 1
+                    },
+                    {
+                      "value": 1
+                    }
+                  ]
+                },
+                "tennis": {
+                  "type": "ball",
+                  "fields": {}
                 }
               }
             }
           }
         }
       },
-      "types": {}
+      "types": {
+        "circle": {
+          "type": "type_def",
+          "parent": "bag",
+          "fields": {
+            "radius": {
+              "type": "box",
+              "value": null,
+              "value_type": "number"
+            }
+          },
+          "devices": {
+            "area": {
+              "type": "device",
+              "input": {
+                "name": "input",
+                "value_type": null,
+                "value": null
+              },
+              "process": [
+                "return 3.14 times radius squared"
+              ],
+              "pattern": null,
+              "comment": "",
+              "boxes": {}
+            }
+          }
+        },
+        "ball": {
+          "type": "type_def",
+          "parent": "circle",
+          "fields": {},
+          "devices": {}
+        }
+      }
     }
   }
 }
