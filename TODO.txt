@@ -1,4 +1,4 @@
 It seems like the parser is very special-case-based.  For example the pattern `(r"^what is (?:the )?(?P<value_of>value of )?(?P<chain>\w+)(?:'s)? link (?P<idx>\d+)\??$",
              self._cmd_query_link),` allows the user to query the value of a chain's link specifically, but it should be replaced by a pattern that allows the user to query the value of any value type or any type with a "value" parameter, like a link or a box.  There are also a number of patterns that reference the builtin types, but need to be able to accept user-created types as well
 
-the pattern on line 152 should be redundant, don't you agree?  Please go through the list of patterns and eliminate redundancy and combine
+Add a "debug parse" command that makes the repl print out the command structure after every input

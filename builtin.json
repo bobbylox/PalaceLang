@@ -7,7 +7,7 @@
         "palace":  { "type": "palace", "rooms": {}, "wings": {}, "types": {} },
         "wing":    { "type": "wing", "rooms": {} },
         "room":    { "type": "room", "contents": {} },
-        "type_def": {"type": "type_def", "parent": "bag", "fields": {}, "devices": {}},
+        "type_def": {"type": "type_def", "parent": "bag"},
         "device":  {
             "type":    "device",
             "input":   { "name": "input", "value_type": null, "value": null },
@@ -120,8 +120,9 @@
     "command": {
         "type": "command",
         "name": null,
-        "body": null,
-        "comment": "A single step in a device's process. body is the raw utterance string."
+        "operator": null,
+        "arguments": [],
+        "comment": "A single step in a device's process. arguments can be values or other commands."
     },
 
     "device": {

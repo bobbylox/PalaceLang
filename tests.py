@@ -35,65 +35,7 @@ def make_repl():
         result = ide.process(utterance)
         if not result["ok"]:
             return result.get("error", "unrecognized")
-        action = result["action"]
-        op = action.get("op", "")
-
-        if op == "run":
-            palace = action.get("palace")
-            room   = action.get("room") or "lobby"
-            device = action["device"]
-            value  = action.get("input")
-            if palace is None:
-                return "not inside a palace"
-            palace_obj = ide.ast.get("palaces", {}).get(palace, {})
-            r = palace_obj.get("rooms", {}).get(room)
-            if r is None:
-                for wing_obj in palace_obj.get("wings", {}).values():
-                    r = wing_obj.get("rooms", {}).get(room)
-                    if r is not None:
-                        break
-            r = r or {}
-            contents = r.get("contents", {})
-            if device not in contents or contents[device].get("type") != "device":
-                return f"no device {device}"
-            dev_meta = contents[device]
-            input_value_type = dev_meta.get("input", {}).get("value_type")
-            if value is None and input_value_type is not None:
-                return f"{device} requires an input of type {input_value_type}"
-            try:
-                return str(interp.run_device(palace, room, device, value))
-            except Exception as e:
-                return f"error — {e}"
-
-        if op == "run.instance":
-            palace = action.get("palace")
-            room_name = action.get("room_name", "lobby")
-            instance = action["instance"]
-            device = action["device"]
-            input_val = action.get("input")
-            if palace is None:
-                return "not inside a palace"
-            try:
-                return str(interp.run_instance_device(palace, room_name, instance, device, input_val))
-            except Exception as e:
-                return f"error — {e}"
-
-        if op == "whereami":
-            parts = []
-            if action.get("device"): parts.append(f"device {action['device']}")
-            if action.get("room"):   parts.append(f"room {action['room']}")
-            if action.get("wing"):   parts.append(f"wing {action['wing']}")
-            if action.get("palace"): parts.append(f"palace {action['palace']}")
-            return ", ".join(parts) if parts else "outside"
-
-        if op == "query.length":       return str(action["length"])
-        if op == "query.step_length":  return str(action["length"])
-        if op == "query.link":
-            return (str(action["value"]) if action.get("value_of")
-                    else action["description"])
-        if op == "look.around":        return action["description"]
-        if op == "set.comment":        return "noted"
-        return "yes"
+        return interp.execute(result["action"])
 
     return ide, interp, repl
 
@@ -796,7 +738,7 @@ class TestUserTypes(unittest.TestCase):
         self.repl("type circle")
         self.repl("enter circle")
         self.repl("box radius")
-        self.assertIn("radius", self._type("circle")["fields"])
+        self.assertIn("radius", self._type("circle"))
         # field should NOT appear in room
         self.assertNotIn("radius", self._lobby()["contents"])
 
@@ -805,22 +747,32 @@ class TestUserTypes(unittest.TestCase):
         self.repl("enter circle")
         self.repl("enter device area")
         self.assertEqual(self.ide.current["device"], "area")
-        self.assertIn("area", self._type("circle")["devices"])
+        self.assertIn("area", self._type("circle"))
 
     def test_step_shorthand_adds_to_process(self):
         self.repl("type circle")
         self.repl("enter circle")
         self.repl("enter device area")
         self.repl("step 1 return 3.14 times radius times radius")
-        process = self._type("circle")["devices"]["area"]["process"]
-        self.assertEqual(process[0], "return 3.14 times radius times radius")
+        process = self._type("circle")["area"]["process"]
+        self.assertEqual(process[0]["type"], "command")
+        self.assertEqual(process[0]["operator"], "return")
+        # expression is fully nested: (3.14 * radius) * radius  (left-associative)
+        # all leaves are typed objects
+        expr = process[0]["arguments"][0]
+        self.assertEqual(expr["operator"], "multiply")
+        self.assertEqual(expr["arguments"][1], {"type": "reference", "name": "radius"})
+        inner = expr["arguments"][0]
+        self.assertEqual(inner["operator"], "multiply")
+        self.assertEqual(inner["arguments"][0], {"type": "number", "value": 3.14})
+        self.assertEqual(inner["arguments"][1], {"type": "reference", "name": "radius"})
 
     def test_set_pattern(self):
         self.repl("type circle")
         self.repl("enter circle")
         self.repl("enter device area")
         self.repl("set pattern to area of name")
-        self.assertEqual(self._type("circle")["devices"]["area"]["pattern"], "area of name")
+        self.assertEqual(self._type("circle")["area"]["pattern"], "area of name")
 
     def test_exit_device_back_to_type(self):
         self.repl("type circle")
@@ -843,23 +795,58 @@ class TestUserTypes(unittest.TestCase):
         self.assertIn("doofus", self._lobby()["contents"])
         self.assertEqual(self._lobby()["contents"]["doofus"]["type"], "circle")
 
+    def test_enter_instance(self):
+        self._setup_circle()
+        self.repl("circle doofus")
+        self.assertEqual(self.repl("enter doofus"), "yes")
+        self.assertEqual(self.ide.current["instance"], "doofus")
+
+    def test_enter_instance_sets_type_in_op(self):
+        self._setup_circle()
+        self.repl("circle doofus")
+        result = self.ide.process("enter doofus")
+        self.assertEqual(result["action"]["operator"], "enter.instance")
+        self.assertEqual(result["action"]["type"], "circle")
+
     def test_instantiate_copies_fields(self):
         self._setup_circle()
         self.repl("circle doofus")
-        self.assertIn("radius", self._lobby()["contents"]["doofus"]["fields"])
+        self.assertIn("radius", self._lobby()["contents"]["doofus"])
+
+    def _doofus_radius(self):
+        return self._lobby()["contents"]["doofus"]["radius"]["value"]
 
     def test_set_instance_field(self):
         self._setup_circle()
         self.repl("circle doofus")
         self.assertEqual(self.repl("set doofus radius to 3"), "yes")
-        self.assertEqual(
-            self._lobby()["contents"]["doofus"]["fields"]["radius"]["value"], 3)
+        self.assertEqual(self._doofus_radius(), 3)
+
+    def test_set_instance_field_possessive(self):
+        self._setup_circle()
+        self.repl("circle doofus")
+        self.assertEqual(self.repl("set doofus's radius to 7"), "yes")
+        self.assertEqual(self._doofus_radius(), 7)
+
+    def test_set_instance_field_after_enter(self):
+        self._setup_circle()
+        self.repl("circle doofus")
+        self.repl("enter doofus")
+        self.assertEqual(self.repl("set radius to 5"), "yes")
+        self.assertEqual(self._doofus_radius(), 5)
 
     def test_run_instance_device(self):
         self._setup_circle()
         self.repl("circle doofus")
         self.repl("set doofus radius to 3")
         result = self.repl("run doofus' area")
+        self.assertAlmostEqual(float(result), 28.26, places=1)
+
+    def test_run_instance_device_no_apostrophe(self):
+        self._setup_circle()
+        self.repl("circle doofus")
+        self.repl("set doofus radius to 3")
+        result = self.repl("run doofus area")
         self.assertAlmostEqual(float(result), 28.26, places=1)
 
     def test_pattern_invocation(self):
@@ -925,6 +912,122 @@ class TestUserTypes(unittest.TestCase):
         r2 = float(self.repl("run bigone' area"))
         self.assertAlmostEqual(r1, 28.26, places=1)
         self.assertAlmostEqual(r2, 314.0, places=0)
+
+    # --- inheritance: instance gets all ancestor fields ---
+
+    def test_child_instance_has_parent_fields(self):
+        # parent type: shape with a colour field
+        self.repl("type shape")
+        self.repl("enter shape")
+        self.repl("box colour")
+        self.repl("exit")
+        # child type: circle inherits shape, adds radius
+        self.repl("type circle from shape")
+        self.repl("enter circle")
+        self.repl("box radius")
+        self.repl("exit")
+        # instance should carry both fields
+        self.repl("circle c")
+        inst = self._lobby()["contents"]["c"]
+        self.assertIn("colour", inst)
+        self.assertIn("radius", inst)
+
+    def test_child_overrides_parent_field(self):
+        # parent defines x with value 0; child redefines x with value 99
+        self.repl("type base")
+        self.repl("enter base")
+        self.repl("box x")
+        self.repl("set x to 0")
+        self.repl("exit")
+        self.repl("type derived from base")
+        self.repl("enter derived")
+        self.repl("box x")
+        self.repl("set x to 99")
+        self.repl("exit")
+        self.repl("derived obj")
+        self.assertEqual(self._lobby()["contents"]["obj"]["x"]["value"], 99)
+
+    def test_three_generation_chain(self):
+        # grandparent → parent → child; all fields present in instance
+        self.repl("type a")
+        self.repl("enter a")
+        self.repl("box alpha")
+        self.repl("exit")
+        self.repl("type b from a")
+        self.repl("enter b")
+        self.repl("box beta")
+        self.repl("exit")
+        self.repl("type c from b")
+        self.repl("enter c")
+        self.repl("box gamma")
+        self.repl("exit")
+        self.repl("c obj")
+        inst = self._lobby()["contents"]["obj"]
+        self.assertIn("alpha", inst)
+        self.assertIn("beta",  inst)
+        self.assertIn("gamma", inst)
+
+    def test_parent_only_instance_unchanged(self):
+        # instantiating the parent type directly should still work normally
+        self.repl("type shape")
+        self.repl("enter shape")
+        self.repl("box colour")
+        self.repl("exit")
+        self.repl("type circle from shape")
+        self.repl("enter circle")
+        self.repl("box radius")
+        self.repl("exit")
+        self.repl("shape s")
+        inst = self._lobby()["contents"]["s"]
+        self.assertIn("colour", inst)
+        self.assertNotIn("radius", inst)
+
+    def test_inherited_fields_are_independent_copies(self):
+        # two instances of a child type must not share field storage
+        self.repl("type base")
+        self.repl("enter base")
+        self.repl("box score")
+        self.repl("exit")
+        self.repl("type child from base")
+        self.repl("enter child")
+        self.repl("box extra")
+        self.repl("exit")
+        self.repl("child a")
+        self.repl("child b")
+        self.repl("set a score to 1")
+        self.repl("set b score to 2")
+        contents = self._lobby()["contents"]
+        self.assertEqual(contents["a"]["score"]["value"], 1)
+        self.assertEqual(contents["b"]["score"]["value"], 2)
+
+    def test_inherited_device_runs(self):
+        # device defined on parent type is callable on a child instance
+        self.repl("type shape")
+        self.repl("enter shape")
+        self.repl("enter device describe")
+        self.repl("step 1 return 42")
+        self.repl("set pattern to describe of name")
+        self.repl("exit")
+        self.repl("exit")
+        self.repl("type circle from shape")
+        self.repl("circle c")
+        result = self.repl("describe of c")
+        self.assertEqual(result, "42")
+
+    def test_inherited_device_via_grandparent(self):
+        # device defined on grandparent is callable on a grandchild instance
+        self.repl("type a")
+        self.repl("enter a")
+        self.repl("enter device ping")
+        self.repl("step 1 return 99")
+        self.repl("set pattern to ping of name")
+        self.repl("exit")
+        self.repl("exit")
+        self.repl("type b from a")
+        self.repl("type c from b")
+        self.repl("c obj")
+        result = self.repl("ping of obj")
+        self.assertEqual(result, "99")
 
 
 # ---------------------------------------------------------------------------

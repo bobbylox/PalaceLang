@@ -89,12 +89,20 @@ class Interpreter:
             raise RuntimeError(f"no instance {instance_name!r}")
         type_name = instance.get("type")
         palace_obj = self.ast.get("palaces", {}).get(palace, {})
-        type_def = palace_obj.get("types", {}).get(type_name)
-        if not type_def:
-            raise RuntimeError(f"no type {type_name!r}")
-        device = type_def.get("devices", {}).get(device_name)
+        types = palace_obj.get("types", {})
+        # Walk the inheritance chain to find the device
+        device = None
+        visited = set()
+        t = type_name
+        while t and t in types and t not in visited:
+            visited.add(t)
+            candidate = types[t].get(device_name)
+            if candidate and isinstance(candidate, dict) and candidate.get("type") == "device":
+                device = candidate
+                break
+            t = types[t].get("parent")
         if not device:
-            raise RuntimeError(f"no method {device_name!r} on type {type_name!r}")
+            raise RuntimeError(f"no device {device_name!r} on type {type_name!r}")
         input_name = device.get("input", {}).get("name", "input")
         ctx = {
             "input": input_value,
@@ -107,47 +115,141 @@ class Interpreter:
         return self._execute_process(device.get("process", []), palace, room_name, ctx)
 
     # ------------------------------------------------------------------
+    # Top-level command execution (single evaluation point)
+    # ------------------------------------------------------------------
+
+    def execute(self, command: dict) -> str:
+        """Execute a command object returned by IDE.process() and return a display string."""
+        op = command.get("operator", "")
+
+        if op == "run":
+            palace = command.get("palace")
+            room   = command.get("room") or "lobby"
+            device = command["device"]
+            value  = command.get("input")
+            if palace is None:
+                return "not inside a palace"
+            palace_obj = self.ast.get("palaces", {}).get(palace, {})
+            r = palace_obj.get("rooms", {}).get(room)
+            if r is None:
+                for wing_obj in palace_obj.get("wings", {}).values():
+                    r = wing_obj.get("rooms", {}).get(room)
+                    if r is not None:
+                        break
+            r = r or {}
+            contents = r.get("contents", {})
+            if device not in contents or contents[device].get("type") != "device":
+                return f"no device {device}"
+            dev_meta = contents[device]
+            input_value_type = dev_meta.get("input", {}).get("value_type")
+            if value is None and input_value_type is not None:
+                return f"{device} requires an input of type {input_value_type}"
+            try:
+                return str(self.run_device(palace, room, device, value))
+            except Exception as e:
+                return f"error — {e}"
+
+        if op == "run.instance":
+            palace    = command.get("palace")
+            room_name = command.get("room_name", "lobby")
+            instance  = command["instance"]
+            device    = command["device"]
+            input_val = command.get("input")
+            if palace is None:
+                return "not inside a palace"
+            try:
+                return str(self.run_instance_device(palace, room_name, instance, device, input_val))
+            except Exception as e:
+                return f"error — {e}"
+
+        if op == "whereami":
+            parts = []
+            if command.get("device"): parts.append(f"device {command['device']}")
+            if command.get("room"):   parts.append(f"room {command['room']}")
+            if command.get("wing"):   parts.append(f"wing {command['wing']}")
+            if command.get("palace"): parts.append(f"palace {command['palace']}")
+            return ", ".join(parts) if parts else "outside"
+
+        if op == "query.length":      return str(command["length"])
+        if op == "query.step_length": return str(command["length"])
+        if op == "query.link":
+            return str(command["value"]) if command.get("value_of") else command["description"]
+        if op == "look.around":  return command["description"]
+        if op == "set.comment":  return "noted"
+        if op == "expr.result":  return str(command["value"])
+        return "yes"
+
+    # ------------------------------------------------------------------
     # Step execution
     # ------------------------------------------------------------------
 
-    def _execute_process(self, steps: List[str], palace: str, room_name: str,
+    @staticmethod
+    def _step_op_args(step) -> tuple:
+        """Normalise a step (command object or legacy string) → (operator, args)."""
+        if isinstance(step, dict) and step.get("type") == "command":
+            return step.get("operator", ""), step.get("arguments", [])
+        # Legacy raw-string fallback
+        s = step.strip() if isinstance(step, str) else ""
+        if not s:
+            return "", []
+        if s == "else":
+            return "else", []
+        if s.startswith("return "):
+            return "return", [s[7:].strip()]
+        if s.startswith("if "):
+            return "if", [s[3:].strip()]
+        m = (re.match(r"^set new box (\w+) to (.+)$", s) or
+             re.match(r"^set new box of (\w+) to (.+)$", s) or
+             re.match(r"^set box (\w+) to (.+)$", s))
+        if m:
+            return "set box", [m.group(1), m.group(2).strip()]
+        m = re.match(r"^(\w+) link (.+) is (.+)$", s)
+        if m:
+            return "link assign", [m.group(1), m.group(2).strip(), m.group(3).strip()]
+        return s, []
+
+    def _execute_process(self, steps: List, palace: str, room_name: str,
                          ctx: Dict[str, Any]):
         local: Dict[str, Any] = {}
         i = 0
         while i < len(steps):
-            step = steps[i].strip()
-            if not step:
+            step = steps[i]
+            if step is None:
+                i += 1
+                continue
+            op, args = self._step_op_args(step)
+            if not op:
                 i += 1
                 continue
 
             # --- if CONDITION ---
-            if step.startswith("if "):
-                cond = self._eval_expr(step[3:], palace, room_name, ctx, local)
+            if op == "if":
+                cond = self._eval_expr(args[0], palace, room_name, ctx, local)
                 if cond:
                     i += 1          # execute true branch (next step)
                 else:
                     # skip forward to "else" or end
                     i += 1
-                    while i < len(steps) and steps[i].strip() != "else":
+                    while i < len(steps):
+                        s_op, _ = self._step_op_args(steps[i])
+                        if s_op == "else":
+                            break
                         i += 1
                     i += 1          # step past the "else" marker itself
                 continue
 
             # --- else marker (reached when true-branch didn't return) ---
-            if step == "else":
+            if op == "else":
                 break
 
             # --- return EXPR ---
-            if step.startswith("return "):
-                return self._eval_expr(step[7:], palace, room_name, ctx, local)
+            if op == "return":
+                return self._eval_expr(args[0], palace, room_name, ctx, local)
 
-            # --- set box / set new box (NAME | of TYPE) to EXPR ---
-            m = (re.match(r"^set new box (\w+) to (.+)$", step) or
-                 re.match(r"^set new box of (\w+) to (.+)$", step) or
-                 re.match(r"^set box (\w+) to (.+)$", step))
-            if m:
-                box_name = m.group(1)
-                val = self._eval_expr(m.group(2), palace, room_name, ctx, local)
+            # --- set box ---
+            if op == "set box":
+                box_name, expr = args[0], args[1]
+                val = self._eval_expr(expr, palace, room_name, ctx, local)
                 room_obj = self._find_room(palace, room_name)
                 dev_obj = room_obj.get("contents", {}).get(ctx.get("device_name"), {})
                 dev_boxes = dev_obj.get("boxes", {})
@@ -173,12 +275,11 @@ class Interpreter:
                 i += 1
                 continue
 
-            # --- CHAIN link EXPR is EXPR  (chain-link assignment) ---
-            m = re.match(r"^(\w+) link (.+) is (.+)$", step)
-            if m:
-                chain_name = m.group(1)
-                idx = self._eval_expr(m.group(2), palace, room_name, ctx, local)
-                val = self._eval_expr(m.group(3), palace, room_name, ctx, local)
+            # --- CHAIN link assign ---
+            if op == "link assign":
+                chain_name, idx_expr, val_expr = args[0], args[1], args[2]
+                idx = self._eval_expr(idx_expr, palace, room_name, ctx, local)
+                val = self._eval_expr(val_expr, palace, room_name, ctx, local)
                 if idx is not None and val is not None:
                     room = self._find_room(palace, room_name)
                     ch = room["contents"].setdefault(chain_name, {"type": "chain", "links": []})
@@ -197,8 +298,98 @@ class Interpreter:
     # Expression evaluation
     # ------------------------------------------------------------------
 
-    def _eval_expr(self, expr: str, palace: str, room_name: str,
+    def _eval_expr(self, expr, palace: str, room_name: str,
                    ctx: Dict[str, Any], local: Dict[str, Any]):
+        # --- typed literal / reference objects (from pre-parser) ---
+        if isinstance(expr, dict):
+            t = expr.get("type")
+
+            if t in ("integer", "number"):
+                return expr["value"]
+            if t == "boolean":
+                return expr["value"]
+            if t == "reference":
+                name = expr["name"]
+                val = self._eval_expr(name, palace, room_name, ctx, local)
+                # Fall back to the name itself so chain names resolve correctly
+                # when there is no variable by that name (e.g. "length of sequence")
+                return val if val is not None else name
+
+            # command object
+            if t == "command":
+                op   = expr.get("operator", "")
+                args = expr.get("arguments", [])
+
+                def ev(a):
+                    return self._eval_expr(a, palace, room_name, ctx, local)
+
+                if op == "less than":
+                    lv, rv = ev(args[0]), ev(args[1])
+                    return lv < rv if lv is not None and rv is not None else None
+                if op == "greater than":
+                    lv, rv = ev(args[0]), ev(args[1])
+                    return lv > rv if lv is not None and rv is not None else None
+                if op == "equal to":
+                    lv, rv = ev(args[0]), ev(args[1])
+                    return lv == rv if lv is not None and rv is not None else None
+                if op == "plus":
+                    lv, rv = ev(args[0]), ev(args[1])
+                    return lv + rv if lv is not None and rv is not None else None
+                if op == "minus":
+                    lv, rv = ev(args[0]), ev(args[1])
+                    return lv - rv if lv is not None and rv is not None else None
+                if op == "multiply":
+                    lv, rv = ev(args[0]), ev(args[1])
+                    return lv * rv if lv is not None and rv is not None else None
+                if op == "divide":
+                    lv, rv = ev(args[0]), ev(args[1])
+                    return lv / rv if lv is not None and rv is not None and rv != 0 else None
+                if op == "squared":
+                    v = ev(args[0])
+                    return v ** 2 if v is not None else None
+                if op == "cubed":
+                    v = ev(args[0])
+                    return v ** 3 if v is not None else None
+                if op == "length of":
+                    chain_name = ev(args[0])
+                    room = self._find_room(palace, room_name)
+                    ch = room["contents"].get(chain_name)
+                    return len(ch["links"]) if ch and ch.get("type") == "chain" else 0
+                if op == "chain link":
+                    chain_name = ev(args[0])
+                    idx = ev(args[1])
+                    if idx is None:
+                        return None
+                    idx = int(idx)
+                    room = self._find_room(palace, room_name)
+                    ch = room["contents"].get(chain_name)
+                    links = ch["links"] if ch and ch.get("type") == "chain" else []
+                    i0 = idx - 1
+                    if i0 < 0:
+                        return None
+                    if i0 >= len(links) or links[i0].get("value") is None:
+                        dev = ctx.get("device_name")
+                        if dev:
+                            return self.run_device(palace, room_name, dev, idx)
+                        return None
+                    return links[i0]["value"]
+                if op == "chain get":
+                    chain_name = ev(args[0])
+                    idx = ev(args[1])
+                    if isinstance(idx, int):
+                        room = self._find_room(palace, room_name)
+                        ch = room["contents"].get(chain_name)
+                        links = ch["links"] if ch and ch.get("type") == "chain" else []
+                        i0 = idx - 1
+                        if 0 <= i0 < len(links):
+                            return links[i0].get("value")
+                return None
+
+            return None  # unknown dict type
+
+        # --- legacy string expression (variable lookup + raw arithmetic fallback) ---
+        if not isinstance(expr, str):
+            return None
         s = expr.strip()
 
         # literal integer
@@ -225,8 +416,8 @@ class Interpreter:
 
         # instance field (when executing in user-type method context)
         instance_obj = ctx.get("instance")
-        if instance_obj is not None and s in instance_obj.get("fields", {}):
-            return instance_obj["fields"][s].get("value")
+        if instance_obj is not None and s != "type" and s in instance_obj:
+            return instance_obj[s].get("value")
 
         # device-level box
         room_obj = self._find_room(palace, room_name)
@@ -251,8 +442,7 @@ class Interpreter:
             ch = room["contents"].get(m.group(1))
             return len(ch["links"]) if ch and ch.get("type") == "chain" else 0
 
-        # CHAIN link EXPR  — e.g. "sequence link input minus 2"
-        # The EXPR after "link" becomes the 1-based index
+        # CHAIN link EXPR
         m = re.match(r"^(\w+) link (.+)$", s)
         if m:
             chain_name = m.group(1)
@@ -263,19 +453,17 @@ class Interpreter:
             room = self._find_room(palace, room_name)
             ch = room["contents"].get(chain_name)
             links = ch["links"] if ch and ch.get("type") == "chain" else []
-            i0 = idx - 1                        # 1-based → 0-based
+            i0 = idx - 1
             if i0 < 0:
                 return None
-            # auto-recurse to fill missing / None slots (memoised fibonacci)
             if i0 >= len(links) or links[i0].get("value") is None:
                 dev = ctx.get("device_name")
                 if dev:
-                    val = self.run_device(palace, room_name, dev, idx)
-                    return val
+                    return self.run_device(palace, room_name, dev, idx)
                 return None
             return links[i0]["value"]
 
-        # CHAIN EXPR  — shorthand e.g. "sequence input" (no "link" keyword)
+        # CHAIN EXPR shorthand
         m = re.match(r"^(\w+) (\w.*)$", s)
         if m:
             chain_name = m.group(1)
@@ -288,11 +476,11 @@ class Interpreter:
                 if 0 <= i0 < len(links):
                     return links[i0].get("value")
 
-        # comparison operators (lowest precedence)
+        # comparison operators
         for op_str, op_fn in [
-            ("is less than", lambda a, b: a < b),
+            ("is less than",    lambda a, b: a < b),
             ("is greater than", lambda a, b: a > b),
-            ("is equal to", lambda a, b: a == b),
+            ("is equal to",     lambda a, b: a == b),
         ]:
             pat = f" {op_str} "
             if pat in s:
@@ -302,15 +490,12 @@ class Interpreter:
                 if lv is not None and rv is not None:
                     return op_fn(lv, rv)
 
-        # addition
         if " plus " in s:
             parts = s.split(" plus ")
-            vals = [self._eval_expr(p, palace, room_name, ctx, local)
-                    for p in parts]
+            vals = [self._eval_expr(p, palace, room_name, ctx, local) for p in parts]
             if all(v is not None for v in vals):
                 return sum(vals)
 
-        # subtraction — rsplit for left-associativity: a-b-c = (a-b)-c
         if " minus " in s:
             a, b = s.rsplit(" minus ", 1)
             av = self._eval_expr(a, palace, room_name, ctx, local)
@@ -318,7 +503,6 @@ class Interpreter:
             if av is not None and bv is not None:
                 return av - bv
 
-        # multiplication
         if " times " in s:
             parts = s.split(" times ")
             result = None
@@ -329,7 +513,6 @@ class Interpreter:
                 result = v if result is None else result * v
             return result
 
-        # division
         if " divided by " in s:
             a, b = s.split(" divided by ", 1)
             av = self._eval_expr(a, palace, room_name, ctx, local)
@@ -337,7 +520,6 @@ class Interpreter:
             if av is not None and bv is not None and bv != 0:
                 return av / bv
 
-        # postfix powers (highest arithmetic precedence)
         if s.endswith(" squared"):
             v = self._eval_expr(s[:-8], palace, room_name, ctx, local)
             return v ** 2 if v is not None else None

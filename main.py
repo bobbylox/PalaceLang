@@ -59,64 +59,9 @@ def main():
             continue
 
         action = result["action"]
-        op = action.get("op", "")
 
-        # ---- run a device ------------------------------------------------
-        if op == "run":
-            palace = action.get("palace")
-            room   = action.get("room") or "lobby"
-            device = action["device"]
-            value  = action.get("input")
-
-            if palace is None:
-                respond("not inside a palace")
-                continue
-
-            palaces = ide.ast.get("palaces", {})
-            palace_obj = palaces.get(palace, {})
-            r = palace_obj.get("rooms", {}).get(room)
-            if r is None:
-                for wing_obj in palace_obj.get("wings", {}).values():
-                    r = wing_obj.get("rooms", {}).get(room)
-                    if r is not None:
-                        break
-            r = r or {}
-            contents = r.get("contents", {})
-            if device not in contents or contents[device].get("type") != "device":
-                respond(f"no device {device}")
-                continue
-
-            dev_meta = contents[device]
-            input_value_type = dev_meta.get("input", {}).get("value_type")
-            if value is None and input_value_type is not None:
-                respond(f"{device} requires an input of type {input_value_type}")
-                continue
-
-            try:
-                out = interp.run_device(palace, room, device, value)
-                respond(str(out))
-            except Exception as e:
-                respond(f"error — {e}")
-            continue
-
-        if op == "run.instance":
-            palace = action.get("palace")
-            room_name = action.get("room_name", "lobby")
-            instance = action["instance"]
-            device = action["device"]
-            input_val = action.get("input")
-            if palace is None:
-                respond("not inside a palace")
-                continue
-            try:
-                out = interp.run_instance_device(palace, room_name, instance, device, input_val)
-                respond(str(out))
-            except Exception as e:
-                respond(f"error — {e}")
-            continue
-
-        # ---- load palace from disk ---------------------------------------
-        if op == "load.palace":
+        # ---- load palace from disk (needs filesystem access) -------------
+        if action.get("operator") == "load.palace":
             name = action["name"]
             filename = name.replace(" ", "_") + ".json"
             if not os.path.exists(filename):
@@ -133,50 +78,7 @@ def main():
             respond("yes")
             continue
 
-        # ---- query responses ---------------------------------------------
-        if op == "whereami":
-            parts = []
-            if action.get("device"):
-                parts.append(f"device {action['device']}")
-            if action.get("room"):
-                parts.append(f"room {action['room']}")
-            if action.get("wing"):
-                parts.append(f"wing {action['wing']}")
-            if action.get("palace"):
-                parts.append(f"palace {action['palace']}")
-            respond(", ".join(parts) if parts else "outside")
-            continue
-
-        if op == "query.length":
-            respond(str(action["length"]))
-            continue
-
-        if op == "query.step_length":
-            respond(str(action["length"]))
-            continue
-
-        if op == "query.link":
-            if action.get("value_of"):
-                respond(str(action["value"]))
-            else:
-                respond(action["description"])
-            continue
-
-        if op == "look.around":
-            respond(action["description"])
-            continue
-
-        if op == "set.comment":
-            respond("noted")
-            continue
-
-        # ---- raw arithmetic expression -----------------------------------
-        if op == "expr.result":
-            respond(str(action["value"]))
-            continue
-
-        # ---- default: anything else is "yes" -----------------------------
-        respond("yes")
+        respond(interp.execute(action))
 
 
 if __name__ == "__main__":

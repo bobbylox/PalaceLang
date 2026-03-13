@@ -38,7 +38,11 @@
                 },
                 "tennis": {
                   "type": "ball",
-                  "fields": {}
+                  "radius": {
+                    "type": "box",
+                    "value": 10,
+                    "value_type": "number"
+                  }
                 }
               }
             }
@@ -49,35 +53,29 @@
         "circle": {
           "type": "type_def",
           "parent": "bag",
-          "fields": {
-            "radius": {
-              "type": "box",
-              "value": null,
-              "value_type": "number"
-            }
+          "radius": {
+            "type": "box",
+            "value": null,
+            "value_type": "number"
           },
-          "devices": {
-            "area": {
-              "type": "device",
-              "input": {
-                "name": "input",
-                "value_type": null,
-                "value": null
-              },
-              "process": [
-                "return 3.14 times radius squared"
-              ],
-              "pattern": null,
-              "comment": "",
-              "boxes": {}
-            }
+          "area": {
+            "type": "device",
+            "input": {
+              "name": "input",
+              "value_type": null,
+              "value": null
+            },
+            "process": [
+              "return 3.14 times radius squared"
+            ],
+            "pattern": "area of name",
+            "comment": "",
+            "boxes": {}
           }
         },
         "ball": {
           "type": "type_def",
-          "parent": "circle",
-          "fields": {},
-          "devices": {}
+          "parent": "circle"
         }
       }
     }

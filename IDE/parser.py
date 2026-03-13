@@ -42,6 +42,9 @@ _STRUCTURAL_KEYS: Dict[str, frozenset] = {
     if not type_name.startswith("_") and isinstance(type_def, dict)
 }
 
+# Reserved keys in a flat type_def dict (everything else is a member).
+_TYPE_DEF_RESERVED = frozenset({"type", "parent"})
+
 # Builtin type names — used to distinguish user-type instances from builtins.
 _BUILTIN_TYPES = frozenset({
     "palace", "wing", "room", "device", "chain", "box", "bag", "type_def", "link"
@@ -267,8 +270,12 @@ _STEP_SH       = _R("Command", "step", "NUM", "Value")
 _RUN_FULL      = _R("Command", "run", "Sname", "APOS", "Sname", "APOS", "Sname")
 _RUN_FULL_ON   = _R("Command", "run", "Sname", "APOS", "Sname", "APOS", "Sname",
                                 "on", "Value")
+_RUN_FULL_NA   = _R("Command", "run", "Sname", "Sname", "Sname")
+_RUN_FULL_ON_NA= _R("Command", "run", "Sname", "Sname", "Sname", "on", "Value")
 _RUN_ROOM      = _R("Command", "run", "Sname", "APOS", "Sname")
 _RUN_ROOM_ON   = _R("Command", "run", "Sname", "APOS", "Sname", "on", "Value")
+_RUN_ROOM_NA   = _R("Command", "run", "Sname", "Sname")
+_RUN_ROOM_ON_NA= _R("Command", "run", "Sname", "Sname", "on", "Value")
 _RUN           = _R("Command", "run", "Sname")
 _RUN_ON        = _R("Command", "run", "Sname", "on", "Value")
 
@@ -403,6 +410,120 @@ def _find_nt_spans(chart, nt, start, end, tokens):
     return []
 
 
+def _parse_expr(s: str) -> Dict:
+    """Recursively parse an expression string into a typed command/value object.
+
+    Every returned object has a "type" field:
+      {"type": "integer",   "value": 2}
+      {"type": "number",    "value": 3.14}
+      {"type": "boolean",   "value": true}
+      {"type": "reference", "name":  "radius"}
+      {"type": "command",   "operator": "...", "arguments": [...]}
+
+    Operator precedence matches the original string-scanning interpreter:
+      chain link / length of  (highest — checked before arithmetic)
+      squared / cubed
+      times / divided by
+      plus / minus
+      comparisons             (lowest)
+    """
+    s = s.strip()
+    if not s:
+        return None
+
+    # literal integer
+    try:
+        return {"type": "integer", "value": int(s)}
+    except ValueError:
+        pass
+
+    # literal float
+    try:
+        return {"type": "number", "value": float(s)}
+    except ValueError:
+        pass
+
+    # literal boolean
+    if s.lower() == "true":
+        return {"type": "boolean", "value": True}
+    if s.lower() == "false":
+        return {"type": "boolean", "value": False}
+
+    # length of CHAIN  (high priority — checked before arithmetic)
+    m = re.match(r"^length of (\w+)$", s)
+    if m:
+        return {"type": "command", "operator": "length of",
+                "arguments": [{"type": "reference", "name": m.group(1)}]}
+
+    # CHAIN link EXPR  (high priority — the index expression takes the rest of
+    # the string, allowing arithmetic inside the index, e.g. "seq link n minus 1")
+    m = re.match(r"^(\w+) link (.+)$", s)
+    if m:
+        return {"type": "command", "operator": "chain link",
+                "arguments": [{"type": "reference", "name": m.group(1)},
+                               _parse_expr(m.group(2))]}
+
+    # comparison operators (lowest arithmetic precedence) — split on first match
+    for op_str, op_name in [
+        ("is less than",    "less than"),
+        ("is greater than", "greater than"),
+        ("is equal to",     "equal to"),
+    ]:
+        pat = f" {op_str} "
+        if pat in s:
+            left, right = s.split(pat, 1)
+            return {"type": "command", "operator": op_name,
+                    "arguments": [_parse_expr(left), _parse_expr(right)]}
+
+    # addition — split on all occurrences, left-fold
+    if " plus " in s:
+        parts = s.split(" plus ")
+        result = _parse_expr(parts[0])
+        for p in parts[1:]:
+            result = {"type": "command", "operator": "plus",
+                      "arguments": [result, _parse_expr(p)]}
+        return result
+
+    # subtraction — rsplit for left-associativity
+    if " minus " in s:
+        a, b = s.rsplit(" minus ", 1)
+        return {"type": "command", "operator": "minus",
+                "arguments": [_parse_expr(a), _parse_expr(b)]}
+
+    # multiplication — split on all occurrences, left-fold
+    if " times " in s:
+        parts = s.split(" times ")
+        result = _parse_expr(parts[0])
+        for p in parts[1:]:
+            result = {"type": "command", "operator": "multiply",
+                      "arguments": [result, _parse_expr(p)]}
+        return result
+
+    # division
+    if " divided by " in s:
+        a, b = s.split(" divided by ", 1)
+        return {"type": "command", "operator": "divide",
+                "arguments": [_parse_expr(a), _parse_expr(b)]}
+
+    # postfix powers
+    if s.endswith(" squared"):
+        return {"type": "command", "operator": "squared",
+                "arguments": [_parse_expr(s[:-8])]}
+    if s.endswith(" cubed"):
+        return {"type": "command", "operator": "cubed",
+                "arguments": [_parse_expr(s[:-6])]}
+
+    # CHAIN EXPR shorthand (e.g. "sequence input") — catch-all two-word form
+    m = re.match(r"^(\w+) (\w.*)$", s)
+    if m:
+        return {"type": "command", "operator": "chain get",
+                "arguments": [{"type": "reference", "name": m.group(1)},
+                               _parse_expr(m.group(2))]}
+
+    # bare variable / input name
+    return {"type": "reference", "name": s}
+
+
 class IDE:
     """Voice-command -> AST translator for Palace Language.
 
@@ -476,7 +597,7 @@ class IDE:
             return None
         td = self._current_type_def_obj()
         if td is not None:
-            return td.get("devices", {}).get(dev)
+            return td.get(dev)
         room = self._current_room_obj()
         if room is None:
             return None
@@ -533,20 +654,29 @@ class IDE:
                                     break
                         if "error" in res:
                             return {"ok": False, "error": res["error"]}
-                    return {"ok": True, "action": res}
+                    return {"ok": True, "action": self._action_to_command(res)}
 
         action = self._try_type_patterns(t)
         if action is not None:
-            return {"ok": True, "action": action}
+            return {"ok": True, "action": self._action_to_command(action)}
 
         try:
             v = self._eval_arith(t)
             if isinstance(v, float) and v.is_integer():
                 v = int(v)
-            return {"ok": True, "action": {"op": "expr.result", "value": v}}
+            return {"ok": True, "action": self._action_to_command({"op": "expr.result", "value": v})}
         except (ValueError, TypeError, ZeroDivisionError):
             pass
         return {"ok": False, "error": f"unrecognized: {t}"}
+
+    def _action_to_command(self, action: dict) -> dict:
+        """Convert an op-dict from _dispatch_earley into a standard command object."""
+        result = dict(action)
+        if "op" in result:
+            result["operator"] = result.pop("op")
+        result.setdefault("type", "command")
+        result.setdefault("arguments", [])
+        return result
 
     def _dispatch_earley(self, ri: int, spans, tokens: List[Token]) -> Dict:
         """Dispatch to the appropriate _cmd_* handler based on the matched rule index."""
@@ -791,6 +921,13 @@ class IDE:
                 palace=_sname(0), room=_sname(1), device=_sname(2), value=_value(0)
             )
 
+        if ri in (_RUN_FULL_NA, _RUN_FULL_ON_NA):
+            # "run" Sname Sname Sname ["on" Value]
+            return self._cmd_run_full(
+                palace=_sname(0), room=_sname(1), device=_sname(2),
+                value=_value(0) if ri == _RUN_FULL_ON_NA else None
+            )
+
         if ri == _RUN_ROOM:
             # "run" Sname APOS Sname
             return self._cmd_run_room(room=_sname(0), device=_sname(1), value=None)
@@ -798,6 +935,13 @@ class IDE:
         if ri == _RUN_ROOM_ON:
             # "run" Sname APOS Sname "on" Value
             return self._cmd_run_room(room=_sname(0), device=_sname(1), value=_value(0))
+
+        if ri in (_RUN_ROOM_NA, _RUN_ROOM_ON_NA):
+            # "run" Sname Sname ["on" Value]
+            return self._cmd_run_room(
+                room=_sname(0), device=_sname(1),
+                value=_value(0) if ri == _RUN_ROOM_ON_NA else None
+            )
 
         if ri == _RUN:
             return self._cmd_run(device=_sname(0), value=None)
@@ -899,7 +1043,7 @@ class IDE:
 
         # If inside a type_def, check for method devices in that type
         td = self._current_type_def_obj()
-        if td is not None and name in td.get("devices", {}):
+        if td is not None and td.get(name, {}).get("type") == "device":
             self.current.update({"device": name, "process_chain": None})
             return {"op": "enter.device", "name": name}
 
@@ -930,12 +1074,18 @@ class IDE:
                                  "device": None, "process_chain": None})
             return {"op": "enter.room", "name": name}
 
-        # enter an existing device in the current room?
+        # enter an existing device or user-type instance in the current room?
         r = self._current_room_obj()
-        if (r is not None and name in r.get("contents", {})
-                and r["contents"][name].get("type") == "device"):
-            self.current.update({"device": name, "process_chain": None})
-            return {"op": "enter.device", "name": name}
+        if r is not None and name in r.get("contents", {}):
+            item = r["contents"][name]
+            item_type = item.get("type")
+            if item_type == "device":
+                self.current.update({"device": name, "process_chain": None})
+                return {"op": "enter.device", "name": name}
+            if item_type not in _BUILTIN_TYPES and item_type is not None:
+                self.current.update({"instance": name, "device": None,
+                                     "process_chain": None})
+                return {"op": "enter.instance", "name": name, "type": item_type}
 
         return {"error": f"cannot find {name!r}"}
 
@@ -1013,10 +1163,9 @@ class IDE:
             err = self._check_room_item_name(r, name, kind)
             if err:
                 return err
-            type_def = palace_obj["types"][kind]
             r["contents"].setdefault(name, {
                 "type": kind,
-                "fields": copy.deepcopy(type_def.get("fields", {})),
+                **self._resolve_inherited_fields(palace_obj, kind),
             })
             self.current.update({"instance": name, "device": None, "process_chain": None})
             return {"op": "enter.instance", "name": name, "type": kind}
@@ -1118,17 +1267,17 @@ class IDE:
                     self.current["instance"] = new
                 return {"op": "rename", "old": old, "new": new}
 
-        # ── 2. Type_def devices and fields (when inside a type) ───────────
+        # ── 2. Type_def members (when inside a type) ──────────────────────
         td = self._current_type_def_obj()
         if td is not None:
-            for bucket in ("devices", "fields"):
-                if old in td.get(bucket, {}):
-                    if new in td[bucket]:
-                        return {"error": f"name {new!r} is already in use in this type"}
-                    td[bucket][new] = td[bucket].pop(old)
-                    if bucket == "devices" and self.current.get("device") == old:
-                        self.current["device"] = new
-                    return {"op": "rename", "old": old, "new": new}
+            if old not in _TYPE_DEF_RESERVED and old in td:
+                if new in td and new not in _TYPE_DEF_RESERVED:
+                    return {"error": f"name {new!r} is already in use in this type"}
+                member = td.pop(old)
+                td[new] = member
+                if member.get("type") == "device" and self.current.get("device") == old:
+                    self.current["device"] = new
+                return {"op": "rename", "old": old, "new": new}
 
         # ── 3. Rooms ───────────────────────────────────────────────────────
         wing = self.current["wing"]
@@ -1309,7 +1458,7 @@ class IDE:
             return {"error": "no palace"}
         td = self._current_type_def_obj()
         if td is not None:
-            td["devices"].setdefault(name, _default("device"))
+            td.setdefault(name, _default("device"))
             return {"op": "device.create", "name": name}
         r = self._current_room_obj()
         err = self._check_room_item_name(r, name, "device")
@@ -1335,6 +1484,22 @@ class IDE:
         if vtype != btype:
             return f"cannot set box of type {btype} to {vtype} value"
         return None
+
+    def _is_subtype_of(self, palace_obj: Dict, child: Optional[str], ancestor: str) -> bool:
+        """Return True if child is ancestor or inherits from ancestor (cycle-safe)."""
+        if child is None:
+            return False
+        if child == ancestor:
+            return True
+        types = palace_obj.get("types", {})
+        visited: set = set()
+        t = child
+        while t and t in types and t not in visited:
+            visited.add(t)
+            t = types[t].get("parent")
+            if t == ancestor:
+                return True
+        return False
 
     def _all_type_names(self, palace: str) -> frozenset:
         """All reserved type names: built-ins + value types + user-defined types."""
@@ -1487,6 +1652,14 @@ class IDE:
         d = self._current_device_obj()
         if d is not None:
             starts.append(d)
+        # current instance (when entered via 'enter NAME')
+        inst_name = self.current.get("instance")
+        if inst_name is not None:
+            r = self._current_room_obj()
+            if r is not None:
+                inst = r.get("contents", {}).get(inst_name)
+                if inst is not None:
+                    starts.append(inst)
         r = self._current_room_obj()
         if r is not None:
             starts.append(r)
@@ -1586,13 +1759,12 @@ class IDE:
         elif ot == "wing":
             return obj.get("rooms", {}).get(name)
         elif ot == "type_def":
-            child = obj.get("devices", {}).get(name)
-            if child is not None:
-                return child
-            return obj.get("fields", {}).get(name)
+            if name not in _TYPE_DEF_RESERVED:
+                return obj.get(name)
         elif ot is not None and ot not in _BUILTIN_TYPES:
-            # User-type instance: navigate into a field
-            return obj.get("fields", {}).get(name)
+            # User-type instance: navigate into a field (flat structure)
+            if name != "type" and name in obj:
+                return obj[name]
         return None
 
     def _path_terminal(self, obj: Dict, name: str) -> Tuple[Optional[Dict], Optional[str]]:
@@ -1628,14 +1800,15 @@ class IDE:
                 return obj, name
 
         elif ot == "type_def":
-            if name in obj:
-                return obj, name
+            if name not in _TYPE_DEF_RESERVED and name in obj:
+                member = obj[name]
+                if isinstance(member, dict) and member.get("type") != "device":
+                    return member, "value"
 
         elif ot is not None and ot not in _BUILTIN_TYPES:
-            # User-type instance: set a field's value
-            fields = obj.get("fields", {})
-            if name in fields:
-                return fields[name], "value"
+            # User-type instance: flat structure
+            if name != "type" and name in obj and isinstance(obj[name], dict):
+                return obj[name], "value"
 
         return None, None
 
@@ -1739,7 +1912,7 @@ class IDE:
         # If in a type_def (but not in a method device), create a field
         td = self._current_type_def_obj()
         if td is not None and self.current["device"] is None:
-            td["fields"].setdefault(name, {"type": "box", "value": None, "value_type": None})
+            td.setdefault(name, {"type": "box", "value": None, "value_type": None})
             return {"op": "field.create", "name": name, "scope": "type"}
         d = self._current_device_obj()
         if d is not None:
@@ -1919,6 +2092,32 @@ class IDE:
                 room["comment"] = value
         return {"op": "set.comment", "value": value}
 
+    def _step_to_command(self, body: str) -> Dict:
+        """Convert a raw step body string into a structured command object."""
+        s = body.strip()
+        if s == "else":
+            return {"type": "command", "operator": "else", "arguments": []}
+        if s.startswith("return "):
+            return {"type": "command", "operator": "return",
+                    "arguments": [_parse_expr(s[7:].strip())]}
+        if s.startswith("if "):
+            return {"type": "command", "operator": "if",
+                    "arguments": [_parse_expr(s[3:].strip())]}
+        m = (re.match(r"^set new box (\w+) to (.+)$", s) or
+             re.match(r"^set new box of (\w+) to (.+)$", s) or
+             re.match(r"^set box (\w+) to (.+)$", s))
+        if m:
+            return {"type": "command", "operator": "set box",
+                    "arguments": [m.group(1), _parse_expr(m.group(2).strip())]}
+        m = re.match(r"^(\w+) link (.+) is (.+)$", s)
+        if m:
+            return {"type": "command", "operator": "link assign",
+                    "arguments": [m.group(1),
+                                  _parse_expr(m.group(2).strip()),
+                                  _parse_expr(m.group(3).strip())]}
+        # fallback: unrecognised body stored verbatim as operator
+        return {"type": "command", "operator": s, "arguments": []}
+
     def _cmd_set_step(self, idx: str, body: str) -> Dict:
         d = self._current_device_obj()
         if d is None:
@@ -1929,8 +2128,8 @@ class IDE:
         if chain == "process":
             steps = d.setdefault("process", [])
             while len(steps) <= i:
-                steps.append("")
-            steps[i] = body
+                steps.append(None)
+            steps[i] = self._step_to_command(body)
         else:
             r = self._current_room_obj()
             links = r["contents"][chain].setdefault("links", [])
@@ -1946,7 +2145,7 @@ class IDE:
         body = self._strip_stop(body.strip())
         chain = self.current["process_chain"] or "process"
         if chain == "process":
-            d.setdefault("process", []).append(body)
+            d.setdefault("process", []).append(self._step_to_command(body))
         else:
             r = self._current_room_obj()
             r["contents"][chain].setdefault("links", []).append({"value": body})
@@ -1959,7 +2158,7 @@ class IDE:
         # If in a type_def, create a method device
         td = self._current_type_def_obj()
         if td is not None:
-            td["devices"].setdefault(name, _default("device"))
+            td.setdefault(name, _default("device"))
             self.current["device"] = name
             self.current["process_chain"] = None
             return {"op": "device.create", "name": name}
@@ -2035,14 +2234,17 @@ class IDE:
         elif type_def is not None:
             td = self._current_type_def_obj()
             if td:
-                for fname, fobj in td.get("fields", {}).items():
-                    ftype = fobj.get("value_type")
-                    if ftype:
-                        items.append(f"a box named {fname!r} (type {ftype})")
+                for mname, mobj in td.items():
+                    if mname in _TYPE_DEF_RESERVED or not isinstance(mobj, dict):
+                        continue
+                    if mobj.get("type") == "device":
+                        items.append(f"a device named {mname!r}")
                     else:
-                        items.append(f"a box named {fname!r}")
-                for dname in td.get("devices", {}):
-                    items.append(f"a device named {dname!r}")
+                        ftype = mobj.get("value_type")
+                        if ftype:
+                            items.append(f"a box named {mname!r} (type {ftype})")
+                        else:
+                            items.append(f"a box named {mname!r}")
 
         elif room is not None:
             r = self._current_room_obj()
@@ -2206,6 +2408,32 @@ class IDE:
         d["pattern"] = value
         return {"op": "set.pattern", "value": value}
 
+    def _resolve_inherited_fields(self, palace_obj: Dict, type_name: str) -> Dict:
+        """Return merged fields for type_name, oldest ancestor first, child overrides last.
+
+        Walks the parent chain, collects user-defined types only (stops at built-ins),
+        then deep-copies each generation's fields from oldest to newest so child
+        definitions overwrite ancestor definitions.  Cycle-safe.
+        """
+        types = palace_obj.get("types", {})
+        chain: List[str] = []
+        visited: set = set()
+        t = type_name
+        while t and t in types and t not in visited:
+            visited.add(t)
+            chain.append(t)
+            t = types[t].get("parent")
+        chain.reverse()   # oldest ancestor first
+        merged: Dict = {}
+        for ancestor in chain:
+            for fname, fdef in types[ancestor].items():
+                if fname in _TYPE_DEF_RESERVED or not isinstance(fdef, dict):
+                    continue
+                if fdef.get("type") == "device":
+                    continue
+                merged[fname] = copy.deepcopy(fdef)
+        return merged
+
     def _cmd_instantiate(self, type_name: str, instance_name: str) -> Dict:
         palace = self.current["palace"]
         if palace is None:
@@ -2214,10 +2442,9 @@ class IDE:
         types = palace_obj.get("types", {})
         if type_name not in types:
             return {"error": f"unknown type {type_name!r}"}
-        type_def = types[type_name]
         instance = {
             "type": type_name,
-            "fields": copy.deepcopy(type_def.get("fields", {})),
+            **self._resolve_inherited_fields(palace_obj, type_name),
         }
         r = self._current_room_obj()
         if r is None:
@@ -2243,10 +2470,11 @@ class IDE:
         type_def = palace_obj.get("types", {}).get(type_name)
         if type_def is None:
             return {"error": f"type {type_name!r} not found"}
-        if field not in type_def.get("fields", {}):
+        if (field in _TYPE_DEF_RESERVED or field not in type_def
+                or type_def[field].get("type") == "device"):
             return {"error": f"no field {field!r} on type {type_name!r}"}
         v = self._parse_value(value)
-        item["fields"].setdefault(field, {"type": "box", "value": None})["value"] = v
+        item.setdefault(field, {"type": "box", "value": None})["value"] = v
         return {"op": "set.instance.field", "instance": instance, "field": field, "value": v}
 
     def _try_type_patterns(self, t: str) -> Optional[Dict]:
@@ -2256,7 +2484,11 @@ class IDE:
             return None
         palace_obj = self.ast["palaces"].get(palace, {})
         for type_name, type_def in palace_obj.get("types", {}).items():
-            for dev_name, dev in type_def.get("devices", {}).items():
+            for dev_name, dev in type_def.items():
+                if dev_name in _TYPE_DEF_RESERVED or not isinstance(dev, dict):
+                    continue
+                if dev.get("type") != "device":
+                    continue
                 pattern_str = dev.get("pattern")
                 if not isinstance(pattern_str, str):
                     continue
@@ -2270,7 +2502,7 @@ class IDE:
                     if room_obj is None:
                         continue
                     item = room_obj.get("contents", {}).get(instance_name)
-                    if item is not None and item.get("type") == type_name:
+                    if item is not None and self._is_subtype_of(palace_obj, item.get("type"), type_name):
                         return {
                             "op": "run.instance",
                             "palace": palace,
