@@ -279,6 +279,8 @@ _RUN_ROOM_ON_NA= _R("Command", "run", "Sname", "Sname", "on", "Value")
 _RUN           = _R("Command", "run", "Sname")
 _RUN_ON        = _R("Command", "run", "Sname", "on", "Value")
 
+_DELETE        = _R("Command", "delete", "Value")
+
 _INSTANTIATE   = _R("Command", "OptNew", "Sname", "OptCalled", "Sname")
 
 
@@ -535,7 +537,7 @@ class IDE:
         self.ast: Dict[str, Any] = {"palaces": {}}
         self.current = {
             "palace": None, "wing": None, "room": None,
-            "type_def": None, "instance": None, "device": None, "process_chain": None
+            "type_def": None, "instance": None, "bag": None, "device": None, "process_chain": None
         }
         # Clipboard: tracks the last name seen overall ("it") and per type ("the room" etc.)
         self._last_by_type: Dict[str, str] = {}
@@ -949,6 +951,9 @@ class IDE:
         if ri == _RUN_ON:
             return self._cmd_run(device=_sname(0), value=_value(0))
 
+        if ri == _DELETE:
+            return self._cmd_delete(spec=_value(0))
+
         if ri == _INSTANTIATE:
             # OptNew Sname OptCalled Sname -> type_name=sname(0), instance_name=sname(1)
             return self._cmd_instantiate(type_name=_sname(0), instance_name=_sname(1))
@@ -1008,7 +1013,7 @@ class IDE:
         self._ensure_room(name, "lobby")   # every palace starts with lobby
         self.current = {
             "palace": name, "wing": None, "room": None,
-            "type_def": None, "instance": None, "device": None, "process_chain": None
+            "type_def": None, "instance": None, "bag": None, "device": None, "process_chain": None
         }
         return {"op": "palace.create", "name": name}
 
@@ -1031,7 +1036,7 @@ class IDE:
         if name in self.ast["palaces"]:
             self.current = {
                 "palace": name, "wing": None, "room": None,
-                "type_def": None, "instance": None, "device": None, "process_chain": None
+                "type_def": None, "instance": None, "bag": None, "device": None, "process_chain": None
             }
             return {"op": "enter.palace", "name": name}
 
@@ -1054,7 +1059,7 @@ class IDE:
 
         # enter a wing?
         if name in palace_obj.get("wings", {}):
-            self.current.update({"wing": name, "room": None,
+            self.current.update({"wing": name, "room": None, "bag": None,
                                  "device": None, "process_chain": None})
             return {"op": "enter.wing", "name": name}
 
@@ -1065,12 +1070,12 @@ class IDE:
         palace_rooms = palace_obj.get("rooms", {})
 
         if name in wing_rooms:
-            self.current.update({"room": name, "device": None,
+            self.current.update({"room": name, "bag": None, "device": None,
                                  "process_chain": None})
             return {"op": "enter.room", "name": name}
 
         if name in palace_rooms:
-            self.current.update({"wing": None, "room": name,
+            self.current.update({"wing": None, "room": name, "bag": None,
                                  "device": None, "process_chain": None})
             return {"op": "enter.room", "name": name}
 
@@ -1104,7 +1109,7 @@ class IDE:
             self._ensure_room(name, "lobby")
             self.current = {
                 "palace": name, "wing": None, "room": "lobby",
-                "type_def": None, "instance": None, "device": None, "process_chain": None
+                "type_def": None, "instance": None, "bag": None, "device": None, "process_chain": None
             }
             return {"op": "enter.palace", "name": name}
 
@@ -1117,7 +1122,7 @@ class IDE:
                 return {"error": f"{name!r} is a type name"}
             self._ensure_wing(palace, name)
             self.current.update({"wing": name, "room": None, "type_def": None,
-                                 "instance": None, "device": None, "process_chain": None})
+                                 "instance": None, "bag": None, "device": None, "process_chain": None})
             return {"op": "enter.wing", "name": name}
 
         if kind == "room":
@@ -1125,7 +1130,7 @@ class IDE:
                 return {"error": f"{name!r} is a type name"}
             self._ensure_room(palace, name, self.current["wing"])
             self.current.update({"room": name, "type_def": None,
-                                 "instance": None, "device": None, "process_chain": None})
+                                 "instance": None, "bag": None, "device": None, "process_chain": None})
             return {"op": "enter.room", "name": name}
 
         # ── Type definition ────────────────────────────────────────────────
@@ -1143,7 +1148,20 @@ class IDE:
                 res["op"] = "enter.device"
             return res
 
-        # ── Generic room-content builtins (chain, bag, box, …) ────────────
+        # ── Bag (enter creates+navigates into bag context) ─────────────────
+        if kind == "bag":
+            r = self._current_room_obj()
+            if r is None:
+                return {"error": "no room"}
+            err = self._check_room_item_name(r, name, "bag")
+            if err:
+                return err
+            r["contents"].setdefault(name, _default("bag"))
+            self.current.update({"bag": name, "instance": None,
+                                 "device": None, "process_chain": None})
+            return {"op": "enter.bag", "name": name}
+
+        # ── Generic room-content builtins (chain, box, …) ─────────────────
         if kind in _ROOM_CONTENT_TYPES:
             r = self._current_room_obj()
             if r is None:
@@ -1177,7 +1195,7 @@ class IDE:
         self.ast["palaces"][name] = palace_data
         self.current = {
             "palace": name, "wing": None, "room": None,
-            "type_def": None, "instance": None, "device": None, "process_chain": None,
+            "type_def": None, "instance": None, "bag": None, "device": None, "process_chain": None,
         }
 
     def _cmd_go_to(self, name: str) -> Dict:
@@ -1187,7 +1205,7 @@ class IDE:
             if name in self.ast.get("palaces", {}):
                 self.current = {
                     "palace": name, "wing": None, "room": None,
-                    "type_def": None, "instance": None, "device": None, "process_chain": None,
+                    "type_def": None, "instance": None, "bag": None, "device": None, "process_chain": None,
                 }
                 return {"op": "go.palace", "name": name}
             # Ask main.py to try loading from disk
@@ -1196,14 +1214,14 @@ class IDE:
 
         # check palace-level rooms
         if name in palace_obj.get("rooms", {}):
-            self.current.update({"wing": None, "room": name,
+            self.current.update({"wing": None, "room": name, "bag": None,
                                  "device": None, "process_chain": None})
             return {"op": "go.room", "name": name}
 
         # check all wings' rooms
         for wing_name, wing_obj in palace_obj.get("wings", {}).items():
             if name in wing_obj.get("rooms", {}):
-                self.current.update({"wing": wing_name, "room": name,
+                self.current.update({"wing": wing_name, "room": name, "bag": None,
                                      "device": None, "process_chain": None})
                 return {"op": "go.room", "name": name}
 
@@ -1212,7 +1230,7 @@ class IDE:
     def _cmd_go_outside(self) -> Dict:
         self.current = {
             "palace": None, "wing": None, "room": None,
-            "type_def": None, "instance": None, "device": None, "process_chain": None
+            "type_def": None, "instance": None, "bag": None, "device": None, "process_chain": None
         }
         return {"op": "go.outside"}
 
@@ -1226,6 +1244,9 @@ class IDE:
         if self.current["instance"] is not None:
             self.current["instance"] = None
             return {"op": "exit.instance"}
+        if self.current.get("bag") is not None:
+            self.current["bag"] = None
+            return {"op": "exit.bag"}
         if self.current["type_def"] is not None:
             self.current["type_def"] = None
             return {"op": "exit.type_def"}
@@ -1239,6 +1260,134 @@ class IDE:
             self.current["palace"] = None
             return {"op": "exit.palace"}
         return {"op": "exit"}
+
+    def _cmd_delete(self, spec: str) -> Dict:
+        """Delete anything reachable by a possessive path or 'CHAIN link N' spec."""
+        if self.current["palace"] is None:
+            return {"error": "no palace"}
+        spec = self._strip_stop(spec.strip())
+        targets = self._path_find_delete_targets(spec)
+        if not targets:
+            return {"error": f"cannot find {spec!r}"}
+        if len(targets) > 1:
+            return {"error": f"ambiguous: {spec!r}"}
+        parent, key, action = targets[0]
+        if action == "null":
+            parent[key] = None
+        elif action == "pop":
+            parent.pop(key)   # list.pop(int_index)
+        else:
+            del parent[key]
+        return {"op": "delete", "spec": spec}
+
+    def _path_find_delete_targets(self, expr: str) -> List:
+        """Return [(parent, key, action)] for every valid deletion target for expr.
+
+        action: "null"   → set parent[key] = None
+                "remove" → del parent[key]   (dict)
+                "pop"    → parent.pop(key)   (list, key is int index)
+        """
+        expr = self._strip_stop(expr.strip())
+        segs = expr.split(" 's ")
+        seen: set = set()
+        results: List = []
+
+        def add(t) -> None:
+            ident = (id(t[0]), t[1])
+            if ident not in seen:
+                seen.add(ident)
+                results.append(t)
+
+        for start in self._path_starting_contexts():
+            for t in self._path_resolve_delete_from(start, segs):
+                add(t)
+
+        return results
+
+    def _path_resolve_delete_from(self, obj: Dict, segs: List[str]) -> List:
+        """Recursively resolve deletion path segments from obj."""
+        if not segs:
+            return []
+
+        seg_words = segs[0].strip().split()
+        remaining_segs = segs[1:]
+        results: List = []
+
+        for name_len in range(len(seg_words), 0, -1):
+            name = " ".join(seg_words[:name_len])
+            suffix = seg_words[name_len:]
+
+            if suffix:
+                if remaining_segs:
+                    new_rem = [" ".join(suffix) + " " + remaining_segs[0]] + remaining_segs[1:]
+                else:
+                    new_rem = [" ".join(suffix)]
+            else:
+                new_rem = remaining_segs
+
+            if not new_rem:
+                t = self._path_terminal_delete(obj, name)
+                if t is not None:
+                    results.append(t)
+            else:
+                child = self._path_nav(obj, name)
+                if child is not None:
+                    results.extend(self._path_resolve_delete_from(child, new_rem))
+
+        # "link N" — splice a chain link out of the links list
+        if len(seg_words) >= 2 and seg_words[0] == "link":
+            try:
+                idx = int(seg_words[1])
+                if obj.get("type") == "chain":
+                    links = obj.get("links", [])
+                    i0 = idx - 1
+                    if 0 <= i0 < len(links):
+                        suffix = seg_words[2:]
+                        if not suffix and not remaining_segs:
+                            results.append((links, i0, "pop"))
+            except (ValueError, IndexError):
+                pass
+
+        return results
+
+    # Properties that may be cleared (nulled) by delete — "name" and "type" are
+    # structural identifiers and must never be deletable.
+    _CLEARABLE_PROPS = frozenset({"value", "value_type", "comment"})
+
+    def _path_terminal_delete(self, obj: Dict, name: str):
+        """Return (parent, key, action) to delete 'name' on obj, or None if not found."""
+        if obj is None:
+            return None
+        ot = obj.get("type")
+
+        # Only clearable mapped properties (not "name" — it's a protected identifier)
+        mapped = _PROP_MAP.get(name)
+        if mapped is not None and mapped in self._CLEARABLE_PROPS and mapped in obj:
+            return (obj, mapped, "null")
+
+        if ot == "room":
+            contents = obj.get("contents", {})
+            if name in contents:
+                return (contents, name, "remove")
+        elif ot == "device":
+            boxes = obj.get("boxes", {})
+            if name in boxes:
+                return (boxes, name, "remove")
+        elif ot == "box":
+            if name in ("value", "value_type"):
+                return (obj, name, "null")
+        elif ot == "bag":
+            data = obj.get("data", {})
+            if name in data:
+                return (data, name, "remove")
+        elif ot == "type_def":
+            if name not in _TYPE_DEF_RESERVED and name in obj:
+                return (obj, name, "remove")
+        elif ot is not None and ot not in _BUILTIN_TYPES:
+            if name != "type" and name in obj:
+                return (obj, name, "remove")
+
+        return None
 
     def _cmd_rename(self, old: str, new: str) -> Dict:
         old = self._strip_stop(old.strip())
@@ -1545,12 +1694,25 @@ class IDE:
                         return {"error": f"{name!r} is already used as a room item"}
         return None
 
+    def _current_bag_obj(self) -> Optional[Dict]:
+        bag = self.current.get("bag")
+        if bag is None:
+            return None
+        r = self._current_room_obj()
+        if r is None:
+            return None
+        return r.get("contents", {}).get(bag)
+
     def _place_box(self, name: str, entry: Dict) -> str:
-        """Insert box entry at current scope; return 'device' or 'room'."""
+        """Insert box entry at current scope; return 'device', 'bag', or 'room'."""
         d = self._current_device_obj()
         if d is not None:
             d.setdefault("boxes", {})[name] = entry
             return "device"
+        bg = self._current_bag_obj()
+        if bg is not None:
+            bg.setdefault("data", {})[name] = entry
+            return "bag"
         r = self._current_room_obj()
         r.setdefault("contents", {})[name] = entry
         return "room"

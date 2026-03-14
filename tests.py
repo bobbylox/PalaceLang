@@ -1433,6 +1433,148 @@ class TestNameConflicts(unittest.TestCase):
 
 
 # ---------------------------------------------------------------------------
+# Delete command
+# ---------------------------------------------------------------------------
+
+class TestDeleteCommand(unittest.TestCase):
+
+    def setUp(self):
+        self.ide, self.interp, self.repl = make_repl()
+        self.repl("palace test")
+        self.repl("enter lobby")
+
+    def _lobby(self):
+        return self.ide.ast["palaces"]["test"]["rooms"]["lobby"]
+
+    # ── delete NAME's PROP (clear value to null) ─────────────────────────
+
+    def test_delete_prop_clears_box_value(self):
+        self.repl("box dice")
+        self.repl("set dice to 6")
+        contents = self._lobby()["contents"]
+        self.assertEqual(contents["dice"]["value"], 6)
+        result = self.repl("delete dice's value")
+        self.assertEqual(result, "yes")
+        self.assertIsNone(contents["dice"]["value"])
+
+    def test_delete_prop_box_still_exists(self):
+        self.repl("box dice")
+        self.repl("set dice to 6")
+        self.repl("delete dice's value")
+        self.assertIn("dice", self._lobby()["contents"])
+
+    # ── delete NAME (remove item from room) ──────────────────────────────
+
+    def test_delete_removes_box(self):
+        self.repl("box dice")
+        result = self.repl("delete dice")
+        self.assertEqual(result, "yes")
+        self.assertNotIn("dice", self._lobby()["contents"])
+
+    def test_delete_removes_chain(self):
+        self.repl("chain sequence")
+        self.repl("append 1 to sequence")
+        self.repl("append 2 to sequence")
+        self.repl("delete sequence")
+        self.assertNotIn("sequence", self._lobby()["contents"])
+
+    def test_delete_unknown_item_errors(self):
+        result = self.repl("delete ghost")
+        self.assertNotEqual(result, "yes")
+
+    # ── delete NAME link N (remove chain link, shift) ────────────────────
+
+    def test_delete_link_removes_correct_link(self):
+        self.repl("chain sequence")
+        for v in [10, 20, 30, 40, 50]:
+            self.repl(f"append {v} to sequence")
+        result = self.repl("delete sequence link 3")
+        self.assertEqual(result, "yes")
+        links = self._lobby()["contents"]["sequence"]["links"]
+        self.assertEqual(len(links), 4)
+        self.assertEqual(links[0]["value"], 10)
+        self.assertEqual(links[1]["value"], 20)
+        # old link 4 (40) is now link 3
+        self.assertEqual(links[2]["value"], 40)
+        self.assertEqual(links[3]["value"], 50)
+
+    def test_delete_link_out_of_range_errors(self):
+        self.repl("chain sequence")
+        self.repl("append 1 to sequence")
+        result = self.repl("delete sequence link 5")
+        self.assertNotEqual(result, "yes")
+
+    def test_delete_link_on_non_chain_errors(self):
+        self.repl("box dice")
+        result = self.repl("delete dice link 1")
+        self.assertNotEqual(result, "yes")
+
+    # ── delete CONTAINER ITEM (remove item from bag) ──────────────────────
+
+    def test_delete_named_removes_box_from_bag(self):
+        self.repl("enter bag thingies")
+        self.repl("box of numbers weight")
+        self.repl("exit")
+        bag = self._lobby()["contents"]["thingies"]
+        self.assertIn("weight", bag["data"])
+        result = self.repl("delete thingies weight")
+        self.assertEqual(result, "yes")
+        self.assertNotIn("weight", bag["data"])
+
+    def test_delete_named_unknown_key_errors(self):
+        self.repl("enter bag thingies")
+        self.repl("exit")
+        result = self.repl("delete thingies ghost")
+        self.assertNotEqual(result, "yes")
+
+    def test_delete_named_unknown_container_errors(self):
+        result = self.repl("delete ghost item")
+        self.assertNotEqual(result, "yes")
+
+    # ── protected fields cannot be deleted ───────────────────────────────
+
+    def test_cannot_delete_name_of_box(self):
+        self.repl("box dice")
+        result = self.repl("delete dice's name")
+        self.assertNotEqual(result, "yes")
+        self.assertIn("dice", self._lobby()["contents"])
+
+    def test_cannot_delete_type_of_box(self):
+        self.repl("box dice")
+        result = self.repl("delete dice's type")
+        self.assertNotEqual(result, "yes")
+        self.assertEqual(self._lobby()["contents"]["dice"]["type"], "box")
+
+    def test_cannot_delete_device_input(self):
+        self.repl("device adder")
+        result = self.repl("delete adder's input")
+        self.assertNotEqual(result, "yes")
+        self.assertIn("input", self._lobby()["contents"]["adder"])
+
+    def test_cannot_delete_device_process(self):
+        self.repl("device adder")
+        result = self.repl("delete adder's process")
+        self.assertNotEqual(result, "yes")
+        self.assertIn("process", self._lobby()["contents"]["adder"])
+
+    # ── bag context: box created inside bag lands in bag.data ─────────────
+
+    def test_enter_bag_creates_box_in_bag_data(self):
+        self.repl("enter bag thingies")
+        self.repl("box of numbers weight")
+        bag = self._lobby()["contents"]["thingies"]
+        self.assertIn("weight", bag["data"])
+        self.assertNotIn("weight", self._lobby()["contents"])
+
+    def test_exit_bag_restores_room_context(self):
+        self.repl("enter bag thingies")
+        self.repl("exit")
+        self.assertIsNone(self.ide.current["bag"])
+        self.repl("box dice")
+        self.assertIn("dice", self._lobby()["contents"])
+
+
+# ---------------------------------------------------------------------------
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)
