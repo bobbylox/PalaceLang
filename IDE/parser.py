@@ -21,6 +21,162 @@ def _default(type_name: str) -> Dict:
     return copy.deepcopy(_DEFAULTS[type_name])
 
 
+_PATTERN_SLOTS    = frozenset({"name", "parent", "input"})
+_PATTERN_RESERVED = frozenset({"name", "parent", "input", "optional"})
+
+
+def _parse_pattern_to_list(raw: str) -> List[str]:
+    """Convert a raw pattern utterance into an annotated token list.
+
+    Modifier keywords consumed during parsing:
+      escape   — next token is stored as a plain literal even if it is a
+                 reserved keyword (name / parent / input / optional).
+      optional — next token (possibly preceded by 'escape') becomes optional;
+                 stored with a trailing '?' (e.g. 'of?' or '<parent>?').
+
+    Slot keywords become '<slot>' or '<slot>?' (if optional).
+    All other tokens are stored as lowercase literals, with '?' appended if optional.
+
+    Examples:
+      "name optional of parent"        → ['<name>', 'of?', '<parent>']
+      "escape name of parent"          → ['name', 'of', '<parent>']
+      "optional escape optional parent"→ ['optional?', '<parent>']
+    """
+    tokens = raw.lower().split()
+    result: List[str] = []
+    i = 0
+    while i < len(tokens):
+        tok = tokens[i]
+
+        if tok == "escape":
+            # Next token is a literal regardless of whether it is reserved.
+            if i + 1 < len(tokens):
+                result.append(tokens[i + 1])
+                i += 2
+            else:
+                i += 1
+
+        elif tok == "optional":
+            # Next token becomes optional.  It may itself be preceded by 'escape'.
+            if i + 1 >= len(tokens):
+                i += 1
+                continue
+            nxt = tokens[i + 1]
+            if nxt == "escape":
+                # optional escape WORD → literal WORD?
+                if i + 2 < len(tokens):
+                    result.append(f"{tokens[i + 2]}?")
+                    i += 3
+                else:
+                    i += 2
+            elif nxt in _PATTERN_SLOTS:
+                result.append(f"<{nxt}>?")
+                i += 2
+            else:
+                result.append(f"{nxt}?")
+                i += 2
+
+        elif tok in _PATTERN_SLOTS:
+            result.append(f"<{tok}>")
+            i += 1
+
+        else:
+            result.append(tok)
+            i += 1
+
+    return result
+
+
+def _pattern_token_list(pattern) -> List[str]:
+    """Extract the token list from either a plain list (legacy) or a pattern object."""
+    if isinstance(pattern, list):
+        return pattern
+    if isinstance(pattern, dict) and pattern.get("type") == "pattern":
+        return [lnk.get("value") or "" for lnk in pattern.get("chain", {}).get("links", [])]
+    return []
+
+
+def _make_pattern_obj(tokens: List[str]) -> Dict:
+    """Build a Palace-style pattern object from a token list."""
+    return {
+        "type": "pattern",
+        "chain": {
+            "type": "chain",
+            "value_type": "string",
+            "links": [{"value": tok} for tok in tokens],
+        },
+    }
+
+
+def _compile_pattern(pattern: List[str], dev_name: str) -> str:
+    """Compile an annotated pattern list into a regex string.
+
+    Token forms:
+      '<name>'   → literal device name
+      '<parent>' → named capture group for the instance name
+      '<input>'  → named capture group for the input value
+      '<slot>?'  → same as above but the whole group is optional (with its \s+)
+      'word'     → regex-escaped literal
+      'word?'    → regex-escaped literal, made optional (with its \s+)
+
+    Optional tokens that open the pattern absorb their trailing \\s+ so that the
+    following mandatory token needs no leading space when they are absent.
+    Optional tokens in the middle or at the end absorb their leading \\s+.
+    """
+    # Build (regex_str, is_optional) pairs first.
+    pairs: List[Tuple[str, bool]] = []
+    used_parent = False
+    used_input  = False
+
+    for tok in pattern:
+        is_opt = tok.endswith("?") and len(tok) > 1
+        core   = tok[:-1] if is_opt else tok
+
+        if core == "<name>":
+            rx = re.escape(dev_name.lower())
+        elif core == "<parent>":
+            if not used_parent:
+                rx = r"(?P<parent_name>\S+)"
+                used_parent = True
+            else:
+                rx = r"\S+"
+        elif core == "<input>":
+            if not used_input:
+                rx = r"(?P<input>.+)"
+                used_input = True
+            else:
+                rx = r".+"
+        else:
+            rx = re.escape(core)
+
+        pairs.append((rx, is_opt))
+
+    if not pairs:
+        return ""
+
+    # Join pairs into a single regex, handling \s+ absorption for optional tokens.
+    # Optional tokens at the *start* absorb their trailing \s+ (so the first
+    # mandatory token needs no leading space when they are absent).
+    # Optional tokens elsewhere absorb their *leading* \s+.
+    result = ""
+    leading_optional = True   # True while we haven't yet seen a mandatory token
+
+    for rx, is_opt in pairs:
+        if leading_optional:
+            if is_opt:
+                result += f"(?:{rx}\\s+)?"   # optional at start: absorb trailing \s+
+            else:
+                result += rx                  # first mandatory token: no leading \s+
+                leading_optional = False
+        else:
+            if is_opt:
+                result += f"(?:\\s+{rx})?"   # optional elsewhere: absorb leading \s+
+            else:
+                result += f"\\s+{rx}"        # mandatory: plain separator
+
+    return result
+
+
 # Canonical property names for possessive-set commands.
 _PROP_MAP: Dict[str, str] = {
     "value type": "value_type",
@@ -634,6 +790,16 @@ class IDE:
 
     def process(self, utterance: str) -> Dict[str, Any]:
         t = self._preprocess(utterance)
+
+        # Pattern-chain commands are checked first when inside a pattern_chain frame.
+        # They use raw-text matching so that tokens like "of?" and "<parent>" — which
+        # the Earley Value grammar cannot represent — are handled correctly.
+        action = self._try_pattern_chain_cmd(t)
+        if action is not None:
+            if "error" in action:
+                return {"ok": False, "error": action["error"]}
+            return {"ok": True, "action": self._action_to_command(action)}
+
         tokens = _tokenize(t)
         # END token is last; it's at index len(tokens)-1
         k = len(tokens) - 1
@@ -1020,6 +1186,15 @@ class IDE:
         return {"op": "palace.create", "name": name}
 
     def _cmd_enter(self, name: str) -> Dict:
+        # enter the pattern chain? (must be in a device that has a pattern)
+        if name == "pattern" and self._current_device_obj() is not None:
+            d = self._current_device_obj()
+            pat = d.get("pattern")
+            if isinstance(pat, dict) and pat.get("type") == "pattern":
+                self._push_nav({"kind": "pattern_chain", "name": "pattern"})
+                return {"op": "enter.pattern"}
+            return {"error": "device has no pattern"}
+
         # enter a command chain? (must be in a device to redirect its process)
         if self._current_device_obj() is not None:
             if name == "process":
@@ -1262,7 +1437,7 @@ class IDE:
         if frame is None:
             return {"op": "exit"}
         kind = frame["kind"]
-        op_suffix = {"process_chain": "process", "type_def": "type_def"}.get(kind, kind)
+        op_suffix = {"process_chain": "process", "type_def": "type_def", "pattern_chain": "pattern"}.get(kind, kind)
         return {"op": f"exit.{op_suffix}"}
 
     def _cmd_delete(self, spec: str) -> Dict:
@@ -1713,6 +1888,18 @@ class IDE:
             return None
         return r.get("contents", {}).get(bag)
 
+    def _current_pattern_chain_obj(self) -> Optional[Dict]:
+        """Return the chain dict inside the current device's pattern, if inside a pattern_chain frame."""
+        if not self.nav_stack or self.nav_stack[-1][0]["kind"] != "pattern_chain":
+            return None
+        d = self._current_device_obj()
+        if d is None:
+            return None
+        pat = d.get("pattern")
+        if not isinstance(pat, dict) or pat.get("type") != "pattern":
+            return None
+        return pat["chain"]
+
     # ------------------------------------------------------------------
     # Navigation stack helpers
     # ------------------------------------------------------------------
@@ -1763,6 +1950,8 @@ class IDE:
                 parts.append(f"type {name!r}")
             elif kind == "process_chain":
                 parts.append(f"chain {name!r}")
+            elif kind == "pattern_chain":
+                parts.append("pattern chain")
             elif kind == "instance":
                 inst_type = frame_info.get("type", "instance")
                 parts.append(f"{inst_type} {name!r}")
@@ -2423,7 +2612,13 @@ class IDE:
         # ── contents ──────────────────────────────────────────────────────────
         items: List[str] = []
 
-        if device is not None:
+        # Pattern chain context takes priority (device is still set when inside one)
+        pc = self._current_pattern_chain_obj()
+        if pc is not None:
+            for i, lnk in enumerate(pc.get("links", []), 1):
+                items.append(f"link {i}: {lnk.get('value')!r}")
+
+        elif device is not None:
             d = self._current_device_obj()
             if d:
                 inp = d.get("input", {})
@@ -2443,7 +2638,9 @@ class IDE:
                     else:
                         items.append(f"a box named {bname!r}")
                 if d.get("pattern"):
-                    items.append(f"a pattern: {d['pattern']!r}")
+                    toks = _pattern_token_list(d["pattern"])
+                    n = len(toks)
+                    items.append(f"a pattern chain with {n} link{'s' if n != 1 else ''}")
                 if d.get("comment"):
                     items.append(f"a comment: {d['comment']!r}")
 
@@ -2641,11 +2838,17 @@ class IDE:
 
     def _cmd_set_pattern(self, value: str) -> Dict:
         value = self._strip_stop(value.strip())
+        # Strip optional leading 'start' delimiter (used when pattern body is ambiguous)
+        if value.lower().startswith("start "):
+            value = value[6:].strip()
+        elif value.lower() == "start":
+            value = ""
         d = self._current_device_obj()
         if d is None:
             return {"error": "not in a device"}
-        d["pattern"] = value
-        return {"op": "set.pattern", "value": value}
+        tokens = _parse_pattern_to_list(value)
+        d["pattern"] = _make_pattern_obj(tokens)
+        return {"op": "set.pattern", "value": tokens}
 
     def _resolve_inherited_fields(self, palace_obj: Dict, type_name: str) -> Dict:
         """Return merged fields for type_name, oldest ancestor first, child overrides last.
@@ -2716,8 +2919,45 @@ class IDE:
         item.setdefault(field, {"type": "box", "value": None})["value"] = v
         return {"op": "set.instance.field", "instance": instance, "field": field, "value": v}
 
+    def _try_pattern_chain_cmd(self, t: str) -> Optional[Dict]:
+        """Raw-text handler for commands inside a pattern_chain frame.
+
+        Handles tokens containing '?' or '<>' that the Earley Value grammar cannot
+        represent.  Only active when the innermost nav frame is 'pattern_chain'.
+
+          set link N to TOKEN  — set link at 1-based index N to TOKEN string
+          append link          — append a null link to the pattern chain
+        """
+        if not self.nav_stack or self.nav_stack[-1][0]["kind"] != "pattern_chain":
+            return None
+        t = t.strip()
+        m = re.match(r'^set\s+link\s+(\d+)\s+to\s+(.+)$', t, re.IGNORECASE)
+        if m:
+            idx = int(m.group(1))
+            token_val = self._strip_stop(m.group(2).strip())
+            pc = self._current_pattern_chain_obj()
+            if pc is None:
+                return {"error": "not inside a pattern chain"}
+            links = pc.setdefault("links", [])
+            while len(links) < idx:
+                links.append({"value": None})
+            links[idx - 1]["value"] = token_val
+            return {"op": "set.pattern.link", "index": idx, "value": token_val}
+        if re.match(r'^append\s+link$', t, re.IGNORECASE):
+            pc = self._current_pattern_chain_obj()
+            if pc is None:
+                return {"error": "not inside a pattern chain"}
+            pc.setdefault("links", []).append({"value": None})
+            return {"op": "pattern.append_link"}
+        return None
+
     def _try_type_patterns(self, t: str) -> Optional[Dict]:
-        """Check user-defined device patterns and return a run.instance action if matched."""
+        """Check user-defined device patterns and return a run.instance action if matched.
+
+        Pattern keywords: 'name' (literal device name), 'parent' (instance capture),
+        'input' (input-value capture).  Patterns are stored in the palace AST and
+        are therefore scoped to the palace where they were defined.
+        """
         palace = self.current["palace"]
         if palace is None:
             return None
@@ -2728,26 +2968,35 @@ class IDE:
                     continue
                 if dev.get("type") != "device":
                     continue
-                pattern_str = dev.get("pattern")
-                if not isinstance(pattern_str, str):
+                tokens = _pattern_token_list(dev.get("pattern"))
+                if not tokens:
                     continue
-                # Convert "name" placeholder into a named capturing group
-                parts = pattern_str.split("name")
-                regex = r"(?P<instance>\w+)".join(re.escape(p) for p in parts)
-                m = re.match(r"^" + regex + r"$", t, re.IGNORECASE)
-                if m:
-                    instance_name = m.group("instance")
-                    room_obj = self._current_room_obj()
-                    if room_obj is None:
-                        continue
-                    item = room_obj.get("contents", {}).get(instance_name)
-                    if item is not None and self._is_subtype_of(palace_obj, item.get("type"), type_name):
-                        return {
-                            "op": "run.instance",
-                            "palace": palace,
-                            "room_name": self.current["room"] or "lobby",
-                            "instance": instance_name,
-                            "device": dev_name,
-                            "input": None,
-                        }
+                try:
+                    regex = _compile_pattern(tokens, dev_name)
+                    m = re.match(r"^" + regex + r"$", t, re.IGNORECASE)
+                except re.error:
+                    continue
+                if not m:
+                    continue
+                groups = m.groupdict()
+                parent_name = groups.get("parent_name")
+                if parent_name is None:
+                    continue  # pattern must have a 'parent' slot
+                parent_name = parent_name.lower()
+                room_obj = self._current_room_obj()
+                if room_obj is None:
+                    continue
+                item = room_obj.get("contents", {}).get(parent_name)
+                if item is None or not self._is_subtype_of(
+                        palace_obj, item.get("type"), type_name):
+                    continue
+                raw_input = groups.get("input")
+                return {
+                    "op": "run.instance",
+                    "palace": palace,
+                    "room_name": self.current["room"] or "lobby",
+                    "instance": parent_name,
+                    "device": dev_name,
+                    "input": self._parse_value(raw_input.strip()) if raw_input else None,
+                }
         return None

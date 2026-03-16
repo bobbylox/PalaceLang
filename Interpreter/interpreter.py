@@ -174,6 +174,8 @@ class Interpreter:
                     parts.append(f"type {name!r}")
                 elif kind == "process_chain":
                     parts.append(f"chain {name!r}")
+                elif kind == "pattern_chain":
+                    parts.append("pattern chain")
                 elif kind == "instance":
                     inst_type = frame.get("type", "instance")
                     parts.append(f"{inst_type} {name!r}")

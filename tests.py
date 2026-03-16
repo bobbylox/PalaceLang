@@ -710,6 +710,13 @@ class TestUserTypes(unittest.TestCase):
     def _type(self, name):
         return self.ide.ast["palaces"]["mypalace"]["types"][name]
 
+    def _pattern_tokens(self, type_name: str, device_name: str):
+        """Extract token list from a pattern object stored on a type's device."""
+        pat = self._type(type_name)[device_name]["pattern"]
+        if isinstance(pat, list):
+            return pat
+        return [lnk["value"] for lnk in pat["chain"]["links"]]
+
     def _setup_circle(self):
         for cmd in [
             "type circle",
@@ -717,7 +724,7 @@ class TestUserTypes(unittest.TestCase):
             "box radius",
             "enter device area",
             "step 1 return 3.14 times radius times radius",
-            "set pattern to area of name",
+            "set pattern to name of parent",
             "exit",
             "exit",
         ]:
@@ -771,8 +778,8 @@ class TestUserTypes(unittest.TestCase):
         self.repl("type circle")
         self.repl("enter circle")
         self.repl("enter device area")
-        self.repl("set pattern to area of name")
-        self.assertEqual(self._type("circle")["area"]["pattern"], "area of name")
+        self.repl("set pattern to name of parent")
+        self.assertEqual(self._pattern_tokens("circle", "area"), ["<name>", "of", "<parent>"])
 
     def test_exit_device_back_to_type(self):
         self.repl("type circle")
@@ -855,6 +862,259 @@ class TestUserTypes(unittest.TestCase):
         self.repl("set doofus radius to 3")
         result = self.repl("area of doofus")
         self.assertAlmostEqual(float(result), 28.26, places=1)
+
+    def test_pattern_start_stop_delimiters(self):
+        # 'start' prefix and 'stop' suffix are stripped from the stored pattern
+        self.repl("type circle")
+        self.repl("enter circle")
+        self.repl("enter device area")
+        self.repl("set pattern to start name of parent stop")
+        self.assertEqual(self._pattern_tokens("circle", "area"), ["<name>", "of", "<parent>"])
+
+    def test_pattern_with_input_slot(self):
+        # 'input' slot captures a value passed to the device
+        for cmd in [
+            "type vector",
+            "enter vector",
+            "box x",
+            "enter device scale",
+            "step 1 return input times x",
+            "set pattern to name parent by input",
+            "exit",
+            "exit",
+        ]:
+            self.repl(cmd)
+        self.repl("vector v")
+        self.repl("set v x to 3")
+        result = self.repl("scale v by 4")
+        self.assertEqual(result, "12")
+
+    def test_pattern_input_slot_full_example(self):
+        # The user's stated example: "get name of parent in input dimensions"
+        for cmd in [
+            "type vector",
+            "enter vector",
+            "box dim",
+            "enter device magnitude",
+            "step 1 return input times dim",
+            "set pattern to get name of parent in input dimensions",
+            "exit",
+            "exit",
+        ]:
+            self.repl(cmd)
+        self.repl("vector distance")
+        self.repl("set distance dim to 3")
+        result = self.repl("get magnitude of distance in 4 dimensions")
+        self.assertEqual(result, "12")
+
+    def test_pattern_only_matches_correct_type(self):
+        # Pattern on 'circle' should not fire for a non-circle instance
+        self._setup_circle()
+        self.repl("circle doofus")
+        self.repl("type square")
+        self.repl("square block")
+        # "area of block" — block is not a circle, so pattern should not match
+        result = self.repl("area of block")
+        self.assertNotEqual(result, "yes")  # won't be a run result
+        self.assertIn("unrecognized", result.lower())
+
+    def test_pattern_scoped_to_palace(self):
+        # Pattern stored in one palace is not accessible in another
+        self._setup_circle()
+        self.repl("circle doofus")
+        result_palace1 = self.repl("area of doofus")
+        self.assertNotIn("unrecognized", result_palace1.lower())
+        # Switch to a different palace
+        self.repl("palace otherplace")
+        self.repl("circle doofus2")
+        # No pattern defined here, so should be unrecognized
+        result_palace2 = self.repl("area of doofus2")
+        self.assertIn("unrecognized", result_palace2.lower())
+
+    # --- optional keyword ---
+
+    def test_optional_keyword_stored_as_question_mark(self):
+        # 'optional X' in the spec → 'X?' in the stored list
+        self.repl("type circle")
+        self.repl("enter circle")
+        self.repl("enter device area")
+        self.repl("set pattern to name optional of parent")
+        self.assertEqual(self._pattern_tokens("circle", "area"),
+                         ["<name>", "of?", "<parent>"])
+
+    def test_optional_literal_matches_with_and_without(self):
+        # Pattern "get name optional of parent" should match both
+        # "get area of doofus" and "get area doofus".
+        # Prefixing with "get" avoids collision with the instantiation Earley rule
+        # (which would parse "area doofus" as type=area, instance=doofus).
+        self._setup_circle()
+        self.repl("circle doofus")
+        self.repl("set doofus radius to 3")
+        # Override the pattern
+        self.repl("enter circle")
+        self.repl("enter device area")
+        self.repl("set pattern to get name optional of parent")
+        self.repl("exit")
+        self.repl("exit")
+        result_with    = self.repl("get area of doofus")
+        result_without = self.repl("get area doofus")
+        self.assertAlmostEqual(float(result_with),    28.26, places=1)
+        self.assertAlmostEqual(float(result_without), 28.26, places=1)
+
+    def test_optional_slot_matches_with_and_without(self):
+        # Pattern "name parent optional input" — input slot is optional.
+        # Device returns input when given, or 0 when absent (input=None → 0 via
+        # a box default).
+        for cmd in [
+            "type scaler", "enter scaler", "box factor",
+            "enter device apply",
+            "step 1 return input times factor",
+            "set pattern to name parent optional input",
+            "exit", "exit",
+        ]:
+            self.repl(cmd)
+        self.repl("scaler s")
+        self.repl("set s factor to 7")
+        # With input the device runs normally
+        self.assertEqual(self.repl("apply s 3"), "21")
+        # Without input the match still succeeds (input=None passed to device)
+        result_no_input = self.repl("apply s")
+        # Result is "None" (None * 7 = None propagated) — the key point is the
+        # pattern matched rather than returning "unrecognized"
+        self.assertNotIn("unrecognized", result_no_input.lower())
+
+    # --- escape keyword ---
+
+    def test_escape_keyword_stored_as_literal(self):
+        # 'escape name' stores the word "name" as a plain literal
+        self.repl("type circle")
+        self.repl("enter circle")
+        self.repl("enter device area")
+        self.repl("set pattern to escape name of parent")
+        self.assertEqual(self._pattern_tokens("circle", "area"),
+                         ["name", "of", "<parent>"])
+
+    def test_escape_prevents_slot_interpretation(self):
+        # Pattern "escape name of parent" matches "name of doofus" literally
+        for cmd in [
+            "type circle", "enter circle", "box radius",
+            "enter device area",
+            "step 1 return 3.14 times radius times radius",
+            "set pattern to escape name of parent",
+            "exit", "exit",
+        ]:
+            self.repl(cmd)
+        self.repl("circle doofus")
+        self.repl("set doofus radius to 3")
+        # Literal "name" in the pattern, not the device name "area"
+        result = self.repl("name of doofus")
+        self.assertAlmostEqual(float(result), 28.26, places=1)
+        # "area of doofus" should NOT match (pattern requires literal "name")
+        bad = self.repl("area of doofus")
+        self.assertIn("unrecognized", bad.lower())
+
+    def test_escape_optional_combo(self):
+        # 'optional escape optional' → literal word "optional" made optional
+        self.repl("type circle")
+        self.repl("enter circle")
+        self.repl("enter device area")
+        self.repl("set pattern to name optional escape optional parent")
+        self.assertEqual(self._pattern_tokens("circle", "area"),
+                         ["<name>", "optional?", "<parent>"])
+
+    # --- pattern chain navigation ---
+
+    def test_enter_pattern_sets_nav_frame(self):
+        self._setup_circle()
+        self.repl("enter circle")
+        self.repl("enter device area")
+        self.assertEqual(self.repl("enter pattern"), "yes")
+        self.assertEqual(self.ide.nav_stack[-1][0]["kind"], "pattern_chain")
+
+    def test_exit_pattern_returns_to_device(self):
+        self._setup_circle()
+        self.repl("enter circle")
+        self.repl("enter device area")
+        self.repl("enter pattern")
+        self.repl("exit")
+        self.assertEqual(self.ide.current["device"], "area")
+        self.assertNotEqual(self.ide.nav_stack[-1][0]["kind"], "pattern_chain")
+
+    def test_enter_pattern_no_pattern_errors(self):
+        self.repl("type circle")
+        self.repl("enter circle")
+        self.repl("enter device area")
+        result = self.repl("enter pattern")
+        self.assertIn("no pattern", result.lower())
+
+    def test_look_around_in_pattern_chain_shows_links(self):
+        self._setup_circle()
+        self.repl("enter circle")
+        self.repl("enter device area")
+        self.repl("enter pattern")
+        result = self.repl("look around")
+        # Default pattern is ["<name>", "of", "<parent>"] — 3 links
+        self.assertIn("link 1", result)
+        self.assertIn("link 2", result)
+        self.assertIn("link 3", result)
+        self.assertIn("<name>", result)
+        self.assertIn("<parent>", result)
+
+    def test_look_around_in_device_shows_pattern_chain_entry(self):
+        self._setup_circle()
+        self.repl("enter circle")
+        self.repl("enter device area")
+        result = self.repl("look around")
+        self.assertIn("pattern chain", result)
+        self.assertIn("3 links", result)
+
+    def test_set_pattern_link_value(self):
+        self._setup_circle()
+        self.repl("enter circle")
+        self.repl("enter device area")
+        self.repl("enter pattern")
+        self.repl("set link 2 to of?")
+        self.assertEqual(self._pattern_tokens("circle", "area"),
+                         ["<name>", "of?", "<parent>"])
+
+    def test_set_pattern_link_slot_value(self):
+        self._setup_circle()
+        self.repl("enter circle")
+        self.repl("enter device area")
+        self.repl("enter pattern")
+        self.repl("set link 1 to <parent>")
+        self.assertEqual(self._pattern_tokens("circle", "area"),
+                         ["<parent>", "of", "<parent>"])
+
+    def test_append_link_in_pattern_chain(self):
+        self._setup_circle()
+        self.repl("enter circle")
+        self.repl("enter device area")
+        self.repl("enter pattern")
+        self.repl("append link")
+        tokens = self._pattern_tokens("circle", "area")
+        self.assertEqual(len(tokens), 4)
+        self.assertIsNone(tokens[3])
+
+    def test_whereami_in_pattern_chain(self):
+        self._setup_circle()
+        self.repl("enter circle")
+        self.repl("enter device area")
+        self.repl("enter pattern")
+        result = self.repl("where am i")
+        self.assertIn("pattern chain", result)
+
+    def test_pattern_stored_as_palace_format(self):
+        # Verify new JSON structure: type=pattern, chain with links
+        self._setup_circle()
+        pat = self._type("circle")["area"]["pattern"]
+        self.assertEqual(pat["type"], "pattern")
+        self.assertEqual(pat["chain"]["type"], "chain")
+        self.assertEqual(pat["chain"]["value_type"], "string")
+        self.assertEqual(len(pat["chain"]["links"]), 3)
+        self.assertEqual(pat["chain"]["links"][0]["value"], "<name>")
+        self.assertEqual(pat["chain"]["links"][1]["value"], "of")
+        self.assertEqual(pat["chain"]["links"][2]["value"], "<parent>")
 
     def test_look_around_in_type(self):
         self.repl("type circle")
@@ -1023,7 +1283,7 @@ class TestUserTypes(unittest.TestCase):
         self.repl("enter shape")
         self.repl("enter device describe")
         self.repl("step 1 return 42")
-        self.repl("set pattern to describe of name")
+        self.repl("set pattern to name of parent")
         self.repl("exit")
         self.repl("exit")
         self.repl("type circle from shape")
@@ -1037,7 +1297,7 @@ class TestUserTypes(unittest.TestCase):
         self.repl("enter a")
         self.repl("enter device ping")
         self.repl("step 1 return 99")
-        self.repl("set pattern to ping of name")
+        self.repl("set pattern to name of parent")
         self.repl("exit")
         self.repl("exit")
         self.repl("type b from a")
