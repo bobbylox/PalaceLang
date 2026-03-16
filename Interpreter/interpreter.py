@@ -163,12 +163,23 @@ class Interpreter:
                 return f"error — {e}"
 
         if op == "whereami":
+            path = command.get("path", [])
+            if not path:
+                return "outside"
             parts = []
-            if command.get("device"): parts.append(f"device {command['device']}")
-            if command.get("room"):   parts.append(f"room {command['room']}")
-            if command.get("wing"):   parts.append(f"wing {command['wing']}")
-            if command.get("palace"): parts.append(f"palace {command['palace']}")
-            return ", ".join(parts) if parts else "outside"
+            for frame in reversed(path):
+                kind = frame["kind"]
+                name = frame["name"]
+                if kind == "type_def":
+                    parts.append(f"type {name!r}")
+                elif kind == "process_chain":
+                    parts.append(f"chain {name!r}")
+                elif kind == "instance":
+                    inst_type = frame.get("type", "instance")
+                    parts.append(f"{inst_type} {name!r}")
+                else:
+                    parts.append(f"{kind} {name!r}")
+            return "You are in " + " in ".join(parts)
 
         if op == "query.length":      return str(command["length"])
         if op == "query.step_length": return str(command["length"])

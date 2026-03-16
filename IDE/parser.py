@@ -539,6 +539,9 @@ class IDE:
             "palace": None, "wing": None, "room": None,
             "type_def": None, "instance": None, "bag": None, "device": None, "process_chain": None
         }
+        # Navigation stack: list of (frame_info, current_snapshot) tuples, outermost first.
+        # Each frame_info is {"kind": str, "name": str, ...optional extras...}.
+        self.nav_stack: List[Tuple[Dict, Dict]] = []
         # Clipboard: tracks the last name seen overall ("it") and per type ("the room" etc.)
         self._last_by_type: Dict[str, str] = {}
         self._last_link_chain: Optional[str] = None  # for "set link value"
@@ -1011,22 +1014,23 @@ class IDE:
             return {"error": f"{name!r} is a built-in type name"}
         self._ensure_palace(name)
         self._ensure_room(name, "lobby")   # every palace starts with lobby
-        self.current = {
-            "palace": name, "wing": None, "room": None,
-            "type_def": None, "instance": None, "bag": None, "device": None, "process_chain": None
-        }
+        self._reset_nav()
+        self._push_nav({"kind": "palace", "name": name})
+        self.current["palace"] = name
         return {"op": "palace.create", "name": name}
 
     def _cmd_enter(self, name: str) -> Dict:
         # enter a command chain? (must be in a device to redirect its process)
         if self._current_device_obj() is not None:
             if name == "process":
+                self._push_nav({"kind": "process_chain", "name": "process"})
                 self.current["process_chain"] = "process"
                 return {"op": "enter.process", "chain": "process"}
             r = self._current_room_obj()
             if r is not None:
                 ch = r.get("contents", {}).get(name)
                 if ch and ch.get("type") == "chain" and ch.get("value_type") == "command":
+                    self._push_nav({"kind": "process_chain", "name": name})
                     self.current["process_chain"] = name
                     return {"op": "enter.process", "chain": name}
         elif name == "process":
@@ -1034,10 +1038,9 @@ class IDE:
 
         # enter a palace?
         if name in self.ast["palaces"]:
-            self.current = {
-                "palace": name, "wing": None, "room": None,
-                "type_def": None, "instance": None, "bag": None, "device": None, "process_chain": None
-            }
+            self._reset_nav()
+            self._push_nav({"kind": "palace", "name": name})
+            self.current["palace"] = name
             return {"op": "enter.palace", "name": name}
 
         palace = self.current["palace"]
@@ -1049,16 +1052,20 @@ class IDE:
         # If inside a type_def, check for method devices in that type
         td = self._current_type_def_obj()
         if td is not None and td.get(name, {}).get("type") == "device":
+            self._push_nav({"kind": "device", "name": name})
             self.current.update({"device": name, "process_chain": None})
             return {"op": "enter.device", "name": name}
 
         # enter a type definition?
         if name in palace_obj.get("types", {}):
+            self._push_nav({"kind": "type_def", "name": name})
             self.current.update({"type_def": name, "device": None, "process_chain": None})
             return {"op": "enter.type_def", "name": name}
 
         # enter a wing?
         if name in palace_obj.get("wings", {}):
+            self._pop_nav_to(("palace",))
+            self._push_nav({"kind": "wing", "name": name})
             self.current.update({"wing": name, "room": None, "bag": None,
                                  "device": None, "process_chain": None})
             return {"op": "enter.wing", "name": name}
@@ -1070,11 +1077,15 @@ class IDE:
         palace_rooms = palace_obj.get("rooms", {})
 
         if name in wing_rooms:
+            self._pop_nav_to(("wing",))
+            self._push_nav({"kind": "room", "name": name})
             self.current.update({"room": name, "bag": None, "device": None,
                                  "process_chain": None})
             return {"op": "enter.room", "name": name}
 
         if name in palace_rooms:
+            self._pop_nav_to(("palace",))
+            self._push_nav({"kind": "room", "name": name})
             self.current.update({"wing": None, "room": name, "bag": None,
                                  "device": None, "process_chain": None})
             return {"op": "enter.room", "name": name}
@@ -1085,9 +1096,11 @@ class IDE:
             item = r["contents"][name]
             item_type = item.get("type")
             if item_type == "device":
+                self._push_nav({"kind": "device", "name": name})
                 self.current.update({"device": name, "process_chain": None})
                 return {"op": "enter.device", "name": name}
             if item_type not in _BUILTIN_TYPES and item_type is not None:
+                self._push_nav({"kind": "instance", "name": name, "type": item_type})
                 self.current.update({"instance": name, "device": None,
                                      "process_chain": None})
                 return {"op": "enter.instance", "name": name, "type": item_type}
@@ -1107,10 +1120,11 @@ class IDE:
                 return {"error": f"{name!r} is a built-in type name"}
             self._ensure_palace(name)
             self._ensure_room(name, "lobby")
-            self.current = {
-                "palace": name, "wing": None, "room": "lobby",
-                "type_def": None, "instance": None, "bag": None, "device": None, "process_chain": None
-            }
+            self._reset_nav()
+            self._push_nav({"kind": "palace", "name": name})
+            self.current["palace"] = name
+            self._push_nav({"kind": "room", "name": "lobby"})
+            self.current["room"] = "lobby"
             return {"op": "enter.palace", "name": name}
 
         palace = self.current["palace"]
@@ -1121,6 +1135,8 @@ class IDE:
             if name in self._all_type_names(palace):
                 return {"error": f"{name!r} is a type name"}
             self._ensure_wing(palace, name)
+            self._pop_nav_to(("palace",))
+            self._push_nav({"kind": "wing", "name": name})
             self.current.update({"wing": name, "room": None, "type_def": None,
                                  "instance": None, "bag": None, "device": None, "process_chain": None})
             return {"op": "enter.wing", "name": name}
@@ -1129,6 +1145,8 @@ class IDE:
             if name in self._all_type_names(palace):
                 return {"error": f"{name!r} is a type name"}
             self._ensure_room(palace, name, self.current["wing"])
+            self._pop_nav_to(("palace", "wing"))
+            self._push_nav({"kind": "room", "name": name})
             self.current.update({"room": name, "type_def": None,
                                  "instance": None, "bag": None, "device": None, "process_chain": None})
             return {"op": "enter.room", "name": name}
@@ -1137,6 +1155,7 @@ class IDE:
         if kind == "type_def":
             palace_obj = self.ast["palaces"][palace]
             palace_obj.setdefault("types", {}).setdefault(name, _default("type_def"))
+            self._push_nav({"kind": "type_def", "name": name})
             self.current.update({"type_def": name, "instance": None,
                                  "device": None, "process_chain": None})
             return {"op": "enter.type_def", "name": name}
@@ -1157,6 +1176,7 @@ class IDE:
             if err:
                 return err
             r["contents"].setdefault(name, _default("bag"))
+            self._push_nav({"kind": "bag", "name": name})
             self.current.update({"bag": name, "instance": None,
                                  "device": None, "process_chain": None})
             return {"op": "enter.bag", "name": name}
@@ -1185,6 +1205,7 @@ class IDE:
                 "type": kind,
                 **self._resolve_inherited_fields(palace_obj, kind),
             })
+            self._push_nav({"kind": "instance", "name": name, "type": kind})
             self.current.update({"instance": name, "device": None, "process_chain": None})
             return {"op": "enter.instance", "name": name, "type": kind}
 
@@ -1193,20 +1214,18 @@ class IDE:
     def load_palace(self, name: str, palace_data: dict):
         """Merge a loaded palace into the AST and navigate into it."""
         self.ast["palaces"][name] = palace_data
-        self.current = {
-            "palace": name, "wing": None, "room": None,
-            "type_def": None, "instance": None, "bag": None, "device": None, "process_chain": None,
-        }
+        self._reset_nav()
+        self._push_nav({"kind": "palace", "name": name})
+        self.current["palace"] = name
 
     def _cmd_go_to(self, name: str) -> Dict:
         palace = self.current["palace"]
         if palace is None:
             # Already loaded in a previous session?
             if name in self.ast.get("palaces", {}):
-                self.current = {
-                    "palace": name, "wing": None, "room": None,
-                    "type_def": None, "instance": None, "bag": None, "device": None, "process_chain": None,
-                }
+                self._reset_nav()
+                self._push_nav({"kind": "palace", "name": name})
+                self.current["palace"] = name
                 return {"op": "go.palace", "name": name}
             # Ask main.py to try loading from disk
             return {"op": "load.palace", "name": name}
@@ -1214,6 +1233,9 @@ class IDE:
 
         # check palace-level rooms
         if name in palace_obj.get("rooms", {}):
+            # Keep only the palace frame, then push room
+            self._pop_nav_to(("palace",))
+            self._push_nav({"kind": "room", "name": name})
             self.current.update({"wing": None, "room": name, "bag": None,
                                  "device": None, "process_chain": None})
             return {"op": "go.room", "name": name}
@@ -1221,45 +1243,27 @@ class IDE:
         # check all wings' rooms
         for wing_name, wing_obj in palace_obj.get("wings", {}).items():
             if name in wing_obj.get("rooms", {}):
-                self.current.update({"wing": wing_name, "room": name, "bag": None,
+                self._pop_nav_to(("palace",))
+                self._push_nav({"kind": "wing", "name": wing_name})
+                self.current["wing"] = wing_name
+                self._push_nav({"kind": "room", "name": name})
+                self.current.update({"room": name, "bag": None,
                                      "device": None, "process_chain": None})
                 return {"op": "go.room", "name": name}
 
         return {"error": f"no room {name}"}
 
     def _cmd_go_outside(self) -> Dict:
-        self.current = {
-            "palace": None, "wing": None, "room": None,
-            "type_def": None, "instance": None, "bag": None, "device": None, "process_chain": None
-        }
+        self._reset_nav()
         return {"op": "go.outside"}
 
     def _cmd_exit(self) -> Dict:
-        if self.current["process_chain"] is not None:
-            self.current["process_chain"] = None
-            return {"op": "exit.process"}
-        if self.current["device"] is not None:
-            self.current["device"] = None
-            return {"op": "exit.device"}
-        if self.current["instance"] is not None:
-            self.current["instance"] = None
-            return {"op": "exit.instance"}
-        if self.current.get("bag") is not None:
-            self.current["bag"] = None
-            return {"op": "exit.bag"}
-        if self.current["type_def"] is not None:
-            self.current["type_def"] = None
-            return {"op": "exit.type_def"}
-        if self.current["room"] is not None:
-            self.current["room"] = None
-            return {"op": "exit.room"}
-        if self.current["wing"] is not None:
-            self.current["wing"] = None
-            return {"op": "exit.wing"}
-        if self.current["palace"] is not None:
-            self.current["palace"] = None
-            return {"op": "exit.palace"}
-        return {"op": "exit"}
+        frame = self._pop_nav()
+        if frame is None:
+            return {"op": "exit"}
+        kind = frame["kind"]
+        op_suffix = {"process_chain": "process", "type_def": "type_def"}.get(kind, kind)
+        return {"op": f"exit.{op_suffix}"}
 
     def _cmd_delete(self, spec: str) -> Dict:
         """Delete anything reachable by a possessive path or 'CHAIN link N' spec."""
@@ -1412,8 +1416,10 @@ class IDE:
                 contents[new] = contents.pop(old)
                 if self.current.get("device") == old:
                     self.current["device"] = new
+                    self._rename_nav_frame("device", old, new)
                 if self.current.get("instance") == old:
                     self.current["instance"] = new
+                    self._rename_nav_frame("instance", old, new)
                 return {"op": "rename", "old": old, "new": new}
 
         # ── 2. Type_def members (when inside a type) ──────────────────────
@@ -1426,6 +1432,7 @@ class IDE:
                 td[new] = member
                 if member.get("type") == "device" and self.current.get("device") == old:
                     self.current["device"] = new
+                    self._rename_nav_frame("device", old, new)
                 return {"op": "rename", "old": old, "new": new}
 
         # ── 3. Rooms ───────────────────────────────────────────────────────
@@ -1440,6 +1447,7 @@ class IDE:
             rooms[new] = rooms.pop(old)
             if self.current.get("room") == old:
                 self.current["room"] = new
+                self._rename_nav_frame("room", old, new)
             return {"op": "rename", "old": old, "new": new}
 
         # ── 4. Wings ───────────────────────────────────────────────────────
@@ -1452,6 +1460,7 @@ class IDE:
             wings[new] = wings.pop(old)
             if self.current.get("wing") == old:
                 self.current["wing"] = new
+                self._rename_nav_frame("wing", old, new)
             return {"op": "rename", "old": old, "new": new}
 
         # ── 5. Types ───────────────────────────────────────────────────────
@@ -1465,6 +1474,7 @@ class IDE:
             types[new] = types.pop(old)
             if self.current.get("type_def") == old:
                 self.current["type_def"] = new
+                self._rename_nav_frame("type_def", old, new)
             return {"op": "rename", "old": old, "new": new}
 
         return {"error": f"cannot find {old!r}"}
@@ -1702,6 +1712,63 @@ class IDE:
         if r is None:
             return None
         return r.get("contents", {}).get(bag)
+
+    # ------------------------------------------------------------------
+    # Navigation stack helpers
+    # ------------------------------------------------------------------
+
+    def _push_nav(self, frame_info: Dict):
+        """Save current state snapshot and push a navigation frame."""
+        self.nav_stack.append((frame_info, dict(self.current)))
+
+    def _pop_nav(self) -> Optional[Dict]:
+        """Pop innermost frame, restoring previous state. Returns frame_info or None."""
+        if not self.nav_stack:
+            return None
+        frame_info, snapshot = self.nav_stack.pop()
+        self.current = snapshot
+        return frame_info
+
+    def _pop_nav_to(self, above_kinds: tuple):
+        """Pop frames until the top frame's kind is in above_kinds (or stack empty)."""
+        while self.nav_stack and self.nav_stack[-1][0]["kind"] not in above_kinds:
+            _, snapshot = self.nav_stack.pop()
+            self.current = snapshot
+
+    def _reset_nav(self):
+        """Clear the navigation stack and reset current to all-None."""
+        self.nav_stack = []
+        self.current = {
+            "palace": None, "wing": None, "room": None,
+            "type_def": None, "instance": None, "bag": None,
+            "device": None, "process_chain": None,
+        }
+
+    def _rename_nav_frame(self, kind: str, old: str, new: str):
+        """Rename the first nav frame of the given kind with the old name."""
+        for frame_info, _ in self.nav_stack:
+            if frame_info["kind"] == kind and frame_info["name"] == old:
+                frame_info["name"] = new
+                return
+
+    def _format_nav_path(self) -> str:
+        """Format current nav path from innermost to outermost."""
+        if not self.nav_stack:
+            return "outside"
+        parts = []
+        for frame_info, _ in reversed(self.nav_stack):
+            kind = frame_info["kind"]
+            name = frame_info["name"]
+            if kind == "type_def":
+                parts.append(f"type {name!r}")
+            elif kind == "process_chain":
+                parts.append(f"chain {name!r}")
+            elif kind == "instance":
+                inst_type = frame_info.get("type", "instance")
+                parts.append(f"{inst_type} {name!r}")
+            else:
+                parts.append(f"{kind} {name!r}")
+        return " in ".join(parts)
 
     def _place_box(self, name: str, entry: Dict) -> str:
         """Insert box entry at current scope; return 'device', 'bag', or 'room'."""
@@ -2321,6 +2388,7 @@ class IDE:
         td = self._current_type_def_obj()
         if td is not None:
             td.setdefault(name, _default("device"))
+            self._push_nav({"kind": "device", "name": name})
             self.current["device"] = name
             self.current["process_chain"] = None
             return {"op": "device.create", "name": name}
@@ -2329,6 +2397,7 @@ class IDE:
         if err:
             return err
         r["contents"].setdefault(name, _default("device"))
+        self._push_nav({"kind": "device", "name": name})
         self.current["device"] = name
         self.current["process_chain"] = None
         return {"op": "device.create", "name": name}
@@ -2339,30 +2408,15 @@ class IDE:
         lines: List[str] = []
 
         palace   = self.current["palace"]
-        wing     = self.current["wing"]
         room     = self.current["room"]
         type_def = self.current["type_def"]
+        instance = self.current.get("instance")
+        bag_name = self.current.get("bag")
         device   = self.current["device"]
 
-        # ── location header ───────────────────────────────────────────────────
-        if device is not None:
-            location = f"device {device!r}"
-            if room:    location += f" in room {room!r}"
-            if wing:    location += f" in wing {wing!r}"
-            if palace:  location += f" in palace {palace!r}"
-        elif type_def is not None:
-            location = f"type {type_def!r}"
-            if palace:  location += f" in palace {palace!r}"
-        elif room is not None:
-            location = f"room {room!r}"
-            if wing:    location += f" in wing {wing!r}"
-            if palace:  location += f" in palace {palace!r}"
-        elif wing is not None:
-            location = f"wing {wing!r}"
-            if palace:  location += f" in palace {palace!r}"
-        elif palace is not None:
-            location = f"palace {palace!r}"
-        else:
+        # ── location header (from nav stack) ──────────────────────────────────
+        location = self._format_nav_path()
+        if location == "outside":
             return {"op": "look.around", "description": "you are outside"}
         lines.append(f"You are in {location}.")
 
@@ -2392,6 +2446,26 @@ class IDE:
                     items.append(f"a pattern: {d['pattern']!r}")
                 if d.get("comment"):
                     items.append(f"a comment: {d['comment']!r}")
+
+        elif instance is not None:
+            r = self._current_room_obj()
+            inst_obj = r.get("contents", {}).get(instance, {}) if r else {}
+            for fname, fobj in inst_obj.items():
+                if fname in ("type", "name"):
+                    continue
+                if isinstance(fobj, dict):
+                    ftype = fobj.get("value_type")
+                    if ftype:
+                        items.append(f"a box named {fname!r} (type {ftype})")
+                    else:
+                        items.append(f"a box named {fname!r}")
+
+        elif bag_name is not None:
+            bag_obj = self._current_bag_obj()
+            if bag_obj:
+                for bname, bobj in bag_obj.get("data", {}).items():
+                    btype = bobj.get("type", "item") if isinstance(bobj, dict) else "item"
+                    items.append(f"a {btype} named {bname!r}")
 
         elif type_def is not None:
             td = self._current_type_def_obj()
@@ -2432,12 +2506,15 @@ class IDE:
         return {"op": "look.around", "description": " ".join(lines)}
 
     def _cmd_whereami(self) -> Dict:
+        path = [dict(fi) for fi, _ in self.nav_stack]
         return {
             "op": "whereami",
-            "palace": self.current["palace"],
-            "wing": self.current["wing"],
-            "room": self.current["room"],
-            "device": self.current["device"],
+            "path":     path,
+            "palace":   self.current["palace"],
+            "wing":     self.current["wing"],
+            "room":     self.current["room"],
+            "instance": self.current.get("instance"),
+            "device":   self.current["device"],
         }
 
     def _cmd_step_length(self) -> Dict:

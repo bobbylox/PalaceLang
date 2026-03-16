@@ -72,7 +72,7 @@ class TestFibonacciSession(unittest.TestCase):
         ("enter device adder over",                                "yes"),
         ("set comment to this is a device for calculating fibonacci numbers recursively",
                                                                        "noted"),
-        ("where am I?",                                                "device adder, room lobby, palace fibonacci"),
+        ("where am I?",                                                "You are in device 'adder' in room 'lobby' in palace 'fibonacci'"),
         ("what is the value of sequence link 2?",                      "1"),
         ("what is sequence link 1?",
          'link 1 is a link with value 0 and next link "link 2"'),
@@ -248,7 +248,7 @@ class TestWingNavigation(unittest.TestCase):
         self.repl("room vault")
         self.repl("enter vault")
         self.assertEqual(self.repl("where am I?"),
-                         "room vault, wing east, palace manor")
+                         "You are in room 'vault' in wing 'east' in palace 'manor'")
 
     def test_go_to_finds_room_across_wings(self):
         self.repl("wing east")
@@ -871,6 +871,23 @@ class TestUserTypes(unittest.TestCase):
         self.repl("circle doofus")
         result = self.repl("look around")
         self.assertIn("a circle named 'doofus'", result)
+
+    def test_look_around_inside_instance_shows_fields(self):
+        self._setup_circle()
+        self.repl("circle doofus")
+        self.repl("enter doofus")
+        result = self.repl("look around")
+        # Should describe the instance, not the surrounding room
+        self.assertIn("doofus", result)
+        self.assertNotIn("a circle named 'doofus'", result)  # room view
+        self.assertIn("radius", result)                      # instance field
+
+    def test_whereami_inside_instance(self):
+        self._setup_circle()
+        self.repl("circle doofus")
+        self.repl("enter doofus")
+        result = self.repl("where am i")
+        self.assertIn("doofus", result)
 
     # --- type inheritance ---
 
