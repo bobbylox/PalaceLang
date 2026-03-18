@@ -375,6 +375,14 @@ _R("Value", "WORD", "Value")
 _R("Value", "NUM",  "Value")
 _R("Value", "APOS", "Value")
 
+# ── RunPath: one or more Sname tokens with optional possessives between them ──
+# Used by "run" commands to specify an arbitrary-depth path to a device.
+# Examples: "adder"  "lobby adder"  "foyer's ball's circumference"
+#           "east wing foyer ball distance"  (each segment is one word)
+_R("RunPath", "Sname")                          # single segment
+_R("RunPath", "Sname", "APOS", "RunPath")       # possessive chain
+_R("RunPath", "Sname", "RunPath")               # space-separated chain
+
 # ── Command rules (lower index = higher priority) ─────────────────────────────
 _LOOK_AROUND  = _R("Command", "look", "around")
 _WHEREAMI     = _R("Command", "where", "am", "i", "OptQM")
@@ -423,17 +431,14 @@ _RENAME        = _R("Command", "rename", "Value", "Value")
 _THEN          = _R("Command", "then", "Value")
 _STEP_SH       = _R("Command", "step", "NUM", "Value")
 
-_RUN_FULL      = _R("Command", "run", "Sname", "APOS", "Sname", "APOS", "Sname")
-_RUN_FULL_ON   = _R("Command", "run", "Sname", "APOS", "Sname", "APOS", "Sname",
-                                "on", "Value")
-_RUN_FULL_NA   = _R("Command", "run", "Sname", "Sname", "Sname")
-_RUN_FULL_ON_NA= _R("Command", "run", "Sname", "Sname", "Sname", "on", "Value")
-_RUN_ROOM      = _R("Command", "run", "Sname", "APOS", "Sname")
-_RUN_ROOM_ON   = _R("Command", "run", "Sname", "APOS", "Sname", "on", "Value")
-_RUN_ROOM_NA   = _R("Command", "run", "Sname", "Sname")
-_RUN_ROOM_ON_NA= _R("Command", "run", "Sname", "Sname", "on", "Value")
-_RUN           = _R("Command", "run", "Sname")
-_RUN_ON        = _R("Command", "run", "Sname", "on", "Value")
+_RUN_ON        = _R("Command", "run", "RunPath", "on", "Value")  # with input (checked first)
+_RUN           = _R("Command", "run", "RunPath")                  # without input
+
+# echo: output a mix of literal strings (start...stop) and evaluated expressions
+# "echo start hello world stop" → "hello world"
+# "echo start prefix stop some expression" → "prefix <result>"
+# "echo some expression" → "<result>"
+_SAY           = _R("Command", "echo", "Value")
 
 _DELETE        = _R("Command", "delete", "Value")
 
@@ -1080,45 +1085,19 @@ class IDE:
                 body=_value(0)
             )
 
-        if ri == _RUN_FULL:
-            # "run" Sname APOS Sname APOS Sname
-            return self._cmd_run_full(
-                palace=_sname(0), room=_sname(1), device=_sname(2), value=None
-            )
+        if ri in (_RUN, _RUN_ON):
+            # Extract RunPath as ordered list of non-APOS word strings
+            path = [tokens[i].orig for sym, s, e, _ in spans
+                    if sym == "RunPath" for i in range(s, e)
+                    if tokens[i].kind != "APOS"]
+            value = _value(0) if ri == _RUN_ON else None
+            return self._cmd_run_path(path=path, value=value)
 
-        if ri == _RUN_FULL_ON:
-            # "run" Sname APOS Sname APOS Sname "on" Value
-            return self._cmd_run_full(
-                palace=_sname(0), room=_sname(1), device=_sname(2), value=_value(0)
-            )
-
-        if ri in (_RUN_FULL_NA, _RUN_FULL_ON_NA):
-            # "run" Sname Sname Sname ["on" Value]
-            return self._cmd_run_full(
-                palace=_sname(0), room=_sname(1), device=_sname(2),
-                value=_value(0) if ri == _RUN_FULL_ON_NA else None
-            )
-
-        if ri == _RUN_ROOM:
-            # "run" Sname APOS Sname
-            return self._cmd_run_room(room=_sname(0), device=_sname(1), value=None)
-
-        if ri == _RUN_ROOM_ON:
-            # "run" Sname APOS Sname "on" Value
-            return self._cmd_run_room(room=_sname(0), device=_sname(1), value=_value(0))
-
-        if ri in (_RUN_ROOM_NA, _RUN_ROOM_ON_NA):
-            # "run" Sname Sname ["on" Value]
-            return self._cmd_run_room(
-                room=_sname(0), device=_sname(1),
-                value=_value(0) if ri == _RUN_ROOM_ON_NA else None
-            )
-
-        if ri == _RUN:
-            return self._cmd_run(device=_sname(0), value=None)
-
-        if ri == _RUN_ON:
-            return self._cmd_run(device=_sname(0), value=_value(0))
+        if ri == _SAY:
+            for sym, s, e, _ in spans:
+                if sym == "Value":
+                    return self._cmd_say(tokens, s, e)
+            return {"error": "echo: no value"}
 
         if ri == _DELETE:
             return self._cmd_delete(spec=_value(0))
@@ -2757,49 +2736,178 @@ class IDE:
 
     # --- run handlers ---
 
-    def _cmd_run(self, device: str, value: Optional[str] = None) -> Dict:
-        return {
-            "op": "run",
-            "palace": self.current["palace"],
-            "room": self.current["room"] or "lobby",
-            "device": device,
-            "input": self._parse_value(value) if value is not None else None,
-        }
+    def _cmd_run_path(self, path: List[str], value: Optional[str] = None) -> Dict:
+        """Unified run handler for arbitrary-depth device paths.
 
-    def _cmd_run_room(self, room: str, device: str,
-                      value: Optional[str] = None) -> Dict:
+        path is an ordered list of name segments (possessives and spaces both
+        produce the same flat list — e.g. "foyer's ball's area" and
+        "foyer ball area" both yield ["foyer", "ball", "area"]).
+
+        Resolution rules (greedy, left-to-right through the AST):
+          1. If the first segment is a known palace name, consume it.
+          2. If the next segment is a known wing name in the current palace, consume it.
+          3. If the next segment is a known room name in the current palace, consume it.
+          4. Any remaining segments before the last are treated as an instance chain;
+             only the immediate instance is threaded through to the interpreter for now.
+          5. The final segment is always the device name.
+        """
+        v = self._parse_value(value) if value is not None else None
         palace = self.current["palace"]
-        # Check if 'room' is actually a user-type instance in the current room
+
+        if not path:
+            return {"error": "empty run path"}
+
+        device = path[-1]
+        context = path[:-1]
+
+        if not context:
+            return {
+                "op": "run",
+                "palace": palace,
+                "room": self.current["room"] or "lobby",
+                "device": device,
+                "input": v,
+            }
+
+        op = self._resolve_run_context(context, palace)
+        op["device"] = device
+        op["input"] = v
+        return op
+
+    def _resolve_run_context(self, context: List[str], palace: str) -> Dict:
+        """Walk a context path through the AST to produce a partial run op dict.
+
+        Returns a dict with 'op' and the relevant address fields (palace, room /
+        palace + room_name + instance).  Caller adds 'device' and 'input'.
+        """
+        palaces = self.ast.get("palaces", {})
+        p = palace
+        i = 0
+
+        # Consume an explicit palace name if present
+        if i < len(context) and context[i] in palaces:
+            p = context[i]
+            i += 1
+
+        p_obj = palaces.get(p, {})
+
+        # Collect all room names in the palace (direct + winged)
+        all_rooms: Dict[str, Any] = dict(p_obj.get("rooms", {}))
+        for w_obj in p_obj.get("wings", {}).values():
+            all_rooms.update(w_obj.get("rooms", {}))
+
+        # Skip a wing name if present (it was already resolved into all_rooms)
+        if i < len(context) and context[i] in p_obj.get("wings", {}):
+            i += 1
+
+        # Consume a room name if present
+        room = self.current.get("room") or "lobby"
+        if i < len(context) and context[i] in all_rooms:
+            room = context[i]
+            i += 1
+
+        # Any remaining segment(s) are an instance chain
+        if i >= len(context):
+            return {"op": "run", "palace": p, "room": room}
+
+        instance = context[i]
+        # (deeper nesting beyond one instance level is stored for future use)
+        return {"op": "run.instance", "palace": p, "room_name": room, "instance": instance}
+
+    # --- echo command ---
+
+    def _tokens_to_str(self, toks: List, s: int, e: int) -> str:
+        """Reconstruct tokens[s:e] as a string, merging APOS directly onto the preceding word."""
+        words: List[str] = []
+        for i in range(s, e):
+            tok = toks[i]
+            if tok.kind == "APOS" and words:
+                words[-1] = words[-1] + tok.orig
+            else:
+                words.append(tok.orig)
+        return " ".join(words)
+
+    def _parse_say_expr(self, expr: str) -> Optional[Dict]:
+        """Parse an expression fragment for use as a say part.
+
+        Returns a command dict (ready for the interpreter) if the expression is
+        recognised, or None if it should be treated as a literal string.
+        """
+        expr = expr.strip()
+        if not expr:
+            return None
+        result = self.process(expr)
+        if result.get("ok"):
+            cmd = result["action"]
+            # For chain link queries, force value-only mode so echo outputs just
+            # the value ("8") rather than the long description string.
+            if cmd.get("operator") == "query.link":
+                cmd = dict(cmd)
+                cmd["value_of"] = True
+            return cmd
+        # Fallback: look up bare names / possessive property in current room
+        expr_lower = expr.lower()
         r = self._current_room_obj()
         if r is not None:
-            item = r.get("contents", {}).get(room)
-            if (item is not None and item.get("type") is not None
-                    and item.get("type") not in _BUILTIN_TYPES):
+            item = r.get("contents", {}).get(expr_lower)
+            if item and item.get("type") == "chain":
                 return {
-                    "op": "run.instance",
-                    "palace": palace,
-                    "room_name": self.current["room"] or "lobby",
-                    "instance": room,
-                    "device": device,
-                    "input": self._parse_value(value) if value is not None else None,
+                    "operator": "query.chain.all",
+                    "type": "command",
+                    "arguments": [],
+                    "palace": self.current["palace"],
+                    "room": self.current["room"] or "lobby",
+                    "name": expr_lower,
                 }
-        return {
-            "op": "run",
-            "palace": palace,
-            "room": room,
-            "device": device,
-            "input": self._parse_value(value) if value is not None else None,
-        }
+            if item and item.get("type") == "box":
+                return {"operator": "query.box", "type": "command", "arguments": [],
+                        "palace": self.current["palace"],
+                        "room": self.current["room"] or "lobby",
+                        "name": expr_lower}
+            # NAME's value → look up box named NAME
+            m = re.match(r"^(\w[\w ]*?)'s?\s+value$", expr_lower)
+            if m:
+                name = m.group(1).strip()
+                bx = r.get("contents", {}).get(name)
+                if bx and bx.get("type") == "box":
+                    return {"operator": "query.box", "type": "command", "arguments": [],
+                            "palace": self.current["palace"],
+                            "room": self.current["room"] or "lobby",
+                            "name": name}
+        return None
 
-    def _cmd_run_full(self, palace: str, room: str, device: str,
-                      value: Optional[str] = None) -> Dict:
-        return {
-            "op": "run",
-            "palace": palace,
-            "room": room,
-            "device": device,
-            "input": self._parse_value(value) if value is not None else None,
-        }
+    def _cmd_say(self, toks: List, s: int, e: int) -> Dict:
+        """Build an echo op from the Value token span [s, e).
+
+        The span may contain any number of interleaved literal sections
+        (delimited by 'start' ... 'stop') and expression sections.
+        """
+        parts: List[Dict] = []
+        i = s
+        while i < e:
+            tok = toks[i]
+            if tok.kind == "WORD" and tok.val == "start":
+                # Literal section: collect tokens up to the next 'stop'
+                j = i + 1
+                while j < e and not (toks[j].kind == "WORD" and toks[j].val == "stop"):
+                    j += 1
+                literal = self._tokens_to_str(toks, i + 1, j)
+                if literal:
+                    parts.append({"type": "literal", "value": literal})
+                i = j + 1   # consume 'stop'
+            else:
+                # Expression section: collect tokens up to next 'start' or end
+                j = i
+                while j < e and not (toks[j].kind == "WORD" and toks[j].val == "start"):
+                    j += 1
+                expr_str = self._tokens_to_str(toks, i, j)
+                cmd = self._parse_say_expr(expr_str)
+                if cmd is not None:
+                    parts.append({"type": "command", "command": cmd})
+                elif expr_str:
+                    parts.append({"type": "literal", "value": expr_str})
+                i = j
+        return {"op": "echo", "parts": parts}
 
     # --- user-type command handlers ---
 

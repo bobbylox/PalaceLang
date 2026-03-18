@@ -190,6 +190,35 @@ class Interpreter:
         if op == "look.around":  return command["description"]
         if op == "set.comment":  return "noted"
         if op == "expr.result":  return str(command["value"])
+
+        if op == "query.chain.all":
+            palace    = command.get("palace")
+            room_name = command.get("room", "lobby")
+            name      = command["name"]
+            r = self._find_room(palace, room_name)
+            ch = (r or {}).get("contents", {}).get(name)
+            if ch is None or ch.get("type") != "chain":
+                return f"no chain '{name}'"
+            values = [str(lnk["value"]) for lnk in ch.get("links", [])
+                      if lnk.get("value") is not None]
+            return ", ".join(values)
+
+        if op == "query.box":  # used by echo sub-expressions
+            r = self._find_room(command.get("palace"), command.get("room", "lobby"))
+            bx = (r or {}).get("contents", {}).get(command["name"])
+            if bx is None:
+                return f"no box '{command['name']}'"
+            return str(bx.get("value", ""))
+
+        if op == "echo":
+            pieces = []
+            for part in command.get("parts", []):
+                if part["type"] == "literal":
+                    pieces.append(part["value"])
+                elif part["type"] == "command":
+                    pieces.append(self.execute(part["command"]))
+            return " ".join(p for p in pieces if p)
+
         return "yes"
 
     # ------------------------------------------------------------------

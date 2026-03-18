@@ -21,7 +21,7 @@
               "contents": {
                 "conga": {
                   "type": "box",
-                  "value": null,
+                  "value": "arrrrrriba",
                   "value_type": "string"
                 },
                 "sea quest": {
@@ -94,12 +94,24 @@
               }
             ],
             "pattern": {
-              "type":"pattern", 
-              "chain":{
-                "type":"chain", 
-                "value_type":"string", 
-                "links":[{"value":"area"}, {"value":"of?"}, {"value":"<parent>"}]}, 
-              "comment": ""}
+              "type": "pattern",
+              "chain": {
+                "type": "chain",
+                "value_type": "string",
+                "links": [
+                  {
+                    "value": "area"
+                  },
+                  {
+                    "value": "of?"
+                  },
+                  {
+                    "value": "<parent>"
+                  }
+                ]
+              },
+              "comment": ""
+            }
           }
         },
         "ball": {

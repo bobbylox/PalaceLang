@@ -1852,6 +1852,100 @@ class TestDeleteCommand(unittest.TestCase):
 
 
 # ---------------------------------------------------------------------------
+# Echo command
+# ---------------------------------------------------------------------------
+
+class TestEchoCommand(unittest.TestCase):
+    """Tests for the 'echo' output command."""
+
+    def setUp(self):
+        self.ide, self.interp, self.repl = make_repl()
+        self.repl("palace test")
+        self.repl("enter lobby")
+
+    def test_say_literal_simple(self):
+        self.assertEqual(self.repl("echo start hello world stop"), "hello world")
+
+    def test_say_literal_strips_over(self):
+        self.assertEqual(self.repl("echo start hello world stop over"), "hello world")
+
+    def test_say_run_device(self):
+        for cmd in ["enter device double", "step 1 return input times 2", "exit"]:
+            self.repl(cmd)
+        self.assertEqual(self.repl("echo run double on 7"), "14")
+
+    def test_say_arithmetic(self):
+        self.assertEqual(self.repl("echo 3 plus 4"), "7")
+
+    def test_say_chain_all_values(self):
+        self.repl("chain nums")
+        for v in [3, 1, 4, 1, 5]:
+            self.repl(f"append {v} to nums")
+        self.assertEqual(self.repl("echo nums"), "3, 1, 4, 1, 5")
+
+    def test_say_chain_link(self):
+        self.repl("chain nums")
+        for v in [10, 20, 30]:
+            self.repl(f"append {v} to nums")
+        self.assertEqual(self.repl("echo nums link 2"), "20")
+
+    def test_say_literal_then_run(self):
+        for cmd in ["enter device double", "step 1 return input times 2", "exit"]:
+            self.repl(cmd)
+        result = self.repl("echo start the answer is stop run double on 5")
+        self.assertEqual(result, "the answer is 10")
+
+    def test_say_literal_then_chain_link(self):
+        self.repl("chain nums")
+        for v in [10, 20, 30]:
+            self.repl(f"append {v} to nums")
+        result = self.repl("echo start second value is stop nums link 2")
+        self.assertEqual(result, "second value is 20")
+
+    def test_say_literal_then_chain_all(self):
+        self.repl("chain primes")
+        for v in [2, 3, 5, 7]:
+            self.repl(f"append {v} to primes")
+        result = self.repl("echo start primes are stop primes")
+        self.assertEqual(result, "primes are 2, 3, 5, 7")
+
+    def test_say_custom_pattern(self):
+        for cmd in ["type circle", "enter circle", "box radius",
+                    "enter device area",
+                    "step 1 return 3.14 times radius times radius",
+                    "set pattern to name of parent", "exit", "exit"]:
+            self.repl(cmd)
+        self.repl("circle doofus")
+        self.repl("set doofus radius to 3")
+        result = self.repl("echo area of doofus")
+        self.assertAlmostEqual(float(result), 28.26, places=1)
+
+    def test_say_literal_then_custom_pattern(self):
+        for cmd in ["type circle", "enter circle", "box radius",
+                    "enter device area",
+                    "step 1 return 3.14 times radius times radius",
+                    "set pattern to name of parent", "exit", "exit"]:
+            self.repl(cmd)
+        self.repl("circle doofus")
+        self.repl("set doofus radius to 3")
+        result = self.repl("echo start doofus area is stop area of doofus")
+        parts = result.split()
+        self.assertEqual(parts[:3], ["doofus", "area", "is"])
+        self.assertAlmostEqual(float(parts[-1]), 28.26, places=1)
+
+    def test_say_run_instance(self):
+        for cmd in ["type circle", "enter circle", "box radius",
+                    "enter device area",
+                    "step 1 return 3.14 times radius times radius",
+                    "exit", "exit"]:
+            self.repl(cmd)
+        self.repl("circle doofus")
+        self.repl("set doofus radius to 3")
+        result = self.repl("echo run doofus area")
+        self.assertAlmostEqual(float(result), 28.26, places=1)
+
+
+# ---------------------------------------------------------------------------
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)
